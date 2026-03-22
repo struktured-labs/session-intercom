@@ -13,7 +13,7 @@ from fastapi import FastAPI
 from .config import BridgeConfig
 from .hook_listener import HookListener
 from .models import ClaudeState, WSEventType
-from .routes import sessions, setup, vehicle, websocket
+from .routes import groups, sessions, setup, vehicle, websocket
 from .session_registry import SessionRegistry
 from .tmux import TmuxManager
 
@@ -88,7 +88,7 @@ async def lifespan(app: FastAPI):
     """Application lifespan — start/stop background services."""
     config: BridgeConfig = app.state.config
     tmux = TmuxManager()
-    registry = SessionRegistry(config.sessions_file, config.socket_dir, tmux)
+    registry = SessionRegistry(config.sessions_file, config.socket_dir, tmux, config.folders_file)
     handler = _make_hook_handler(app)
     hook_listener = HookListener(config.socket_dir, handler)
 
@@ -122,6 +122,7 @@ def create_app(config: BridgeConfig | None = None) -> FastAPI:
 
     # Mount route modules
     app.include_router(sessions.router)
+    app.include_router(groups.router)
     app.include_router(websocket.router)
     app.include_router(vehicle.router)
     app.include_router(setup.router)

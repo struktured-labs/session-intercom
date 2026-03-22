@@ -68,6 +68,7 @@ class SessionSummary(BaseModel):
     yolo: YoloSettings = Field(default_factory=YoloSettings)
     created_at: Optional[datetime] = None
     last_activity: Optional[datetime] = None
+    folder_id: Optional[str] = None
 
 
 class SessionDetail(SessionSummary):
@@ -91,6 +92,31 @@ class Transcript(BaseModel):
     session_name: str
     messages: list[TranscriptMessage] = []
     raw: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Session folder (group) models
+# ---------------------------------------------------------------------------
+
+class SessionFolderInfo(BaseModel):
+    """A named grouping folder for sessions."""
+    folder_id: str
+    name: str
+    color: str = ""  # hex color string, e.g. "#ff5500"
+    created_at: Optional[datetime] = None
+    sort_order: int = 0
+    member_count: int = 0
+
+
+class SessionFolderCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    color: str = ""
+
+
+class SessionFolderUpdate(BaseModel):
+    name: Optional[str] = None
+    color: Optional[str] = None
+    sort_order: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------

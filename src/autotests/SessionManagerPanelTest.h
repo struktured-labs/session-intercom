@@ -117,6 +117,16 @@ private Q_SLOTS:
     void testAutoArchiveClosedSessions();
     void testAutoArchiveSkipsPinned();
     void testAutoArchiveSkipsRecent();
+
+    // Session folders
+    void testCreateFolder();
+    void testRenameFolderEmpty();
+    void testDeleteFolderUngroupsSessions();
+    void testMoveSessionToFolder();
+    void testRemoveSessionFromFolder();
+    void testFolderIdPersistence();
+    void testFoldersPersistence();
+    void testTreeRoutesGroupedSessionsToFolder();
 };
 
 }

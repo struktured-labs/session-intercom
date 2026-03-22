@@ -30,6 +30,7 @@ class BridgeConfig(BaseSettings):
 
     # Paths
     sessions_file: Path = Field(default=_DEFAULT_SESSIONS_FILE)
+    folders_file: Path = Field(default=_DEFAULT_DATA_DIR / "session_folders.json")
     socket_dir: Path = Field(default=_DEFAULT_SOCKET_DIR)
 
     # Android Auto / CarPlay

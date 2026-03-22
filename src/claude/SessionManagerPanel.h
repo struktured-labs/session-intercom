@@ -12,6 +12,7 @@
 #include "ClaudeSessionRegistry.h"
 
 #include <QClipboard>
+#include <QColor>
 #include <QDateTime>
 #include <QDesktopServices>
 #include <QDir>
@@ -88,6 +89,20 @@ struct KONSOLEPRIVATE_EXPORT SessionMetadata {
     QVector<SubprocessInfo> subprocesses;
     QMap<int, QString> promptGroupLabels;
     int currentPromptRound = 0;
+
+    // Session folder membership (empty = ungrouped)
+    QString folderId;
+};
+
+/**
+ * Named folder for grouping related sessions (e.g. agent fleets, projects)
+ */
+struct KONSOLEPRIVATE_EXPORT SessionFolderInfo {
+    QString folderId;
+    QString name;
+    QColor color;
+    QDateTime createdAt;
+    int sortOrder = 0;
 };
 
 /**
@@ -240,6 +255,41 @@ public Q_SLOTS:
     void setSessionAgentId(const QString &sessionId, const QString &agentId);
 
     /**
+     * Create a new session folder
+     */
+    void createFolder(const QString &name, const QColor &color = QColor());
+
+    /**
+     * Rename a session folder
+     */
+    void renameFolder(const QString &folderId, const QString &newName);
+
+    /**
+     * Change a session folder's color
+     */
+    void setFolderColor(const QString &folderId, const QColor &color);
+
+    /**
+     * Delete a session folder (ungroups all member sessions)
+     */
+    void deleteFolder(const QString &folderId);
+
+    /**
+     * Move a session into a folder
+     */
+    void moveSessionToFolder(const QString &sessionId, const QString &folderId);
+
+    /**
+     * Remove a session from its folder (back to ungrouped)
+     */
+    void removeSessionFromFolder(const QString &sessionId);
+
+    /**
+     * Get all session folders
+     */
+    QList<SessionFolderInfo> allFolders() const;
+
+    /**
      * Auto-archive closed sessions older than 7 days.
      * Runs periodically on a timer; can also be called manually.
      */
@@ -322,6 +372,11 @@ Q_SIGNALS:
      */
     void usageAggregateChanged();
 
+    /**
+     * Emitted when session folders are created, modified, or deleted
+     */
+    void foldersChanged();
+
 private Q_SLOTS:
     void onItemDoubleClicked(QTreeWidgetItem *item, int column);
     void onContextMenu(const QPoint &pos);
@@ -335,6 +390,8 @@ private:
     void showReadyState();
     void loadMetadata();
     void saveMetadata(bool sync = false);
+    void loadFolders();
+    void saveFolders();
     void scheduleTreeUpdate(); // debounced — coalesces rapid-fire calls
     void scheduleMetadataSave(); // debounced — coalesces rapid-fire saves
     void updateTreeWidget();
@@ -383,6 +440,10 @@ private:
     QMap<QString, QPointer<ClaudeSession>> m_activeSessions;
     ClaudeSessionRegistry *m_registry = nullptr;
     bool m_collapsed = false;
+
+    // Session folders
+    QMap<QString, SessionFolderInfo> m_folders;
+    QMap<QString, QTreeWidgetItem *> m_folderTreeItems; // folderId → tree item
 
     // Debounce timer for updateTreeWidget — coalesces rapid-fire signals
     QTimer *m_updateDebounce = nullptr;

@@ -70,9 +70,15 @@ void SessionManagerPanelTest::cleanupTestCase()
 {
 }
 
+static QString foldersFilePath()
+{
+    return QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + QStringLiteral("/session_folders.json");
+}
+
 void SessionManagerPanelTest::cleanup()
 {
     QFile::remove(sessionsFilePath());
+    QFile::remove(foldersFilePath());
 }
 
 // ============================================================
@@ -1843,6 +1849,164 @@ void SessionManagerPanelTest::testAutoArchiveSkipsRecent()
     const SessionMetadata *meta = panel.sessionMetadata(QStringLiteral("rec11111"));
     QVERIFY(meta);
     QVERIFY(!meta->isArchived);
+}
+
+// ============================================================
+// Session folders
+// ============================================================
+
+void SessionManagerPanelTest::testCreateFolder()
+{
+    SessionManagerPanel_INIT(panel);
+    QCOMPARE(panel.allFolders().size(), 0);
+
+    panel.createFolder(QStringLiteral("My Fleet"), QColor(Qt::red));
+    QCOMPARE(panel.allFolders().size(), 1);
+    QCOMPARE(panel.allFolders().first().name, QStringLiteral("My Fleet"));
+    QVERIFY(panel.allFolders().first().color == QColor(Qt::red));
+    QVERIFY(!panel.allFolders().first().folderId.isEmpty());
+}
+
+void SessionManagerPanelTest::testRenameFolderEmpty()
+{
+    SessionManagerPanel_INIT(panel);
+    panel.createFolder(QStringLiteral("Test"), QColor());
+    QString fid = panel.allFolders().first().folderId;
+
+    // Empty name should be rejected
+    panel.renameFolder(fid, QString());
+    QCOMPARE(panel.allFolders().first().name, QStringLiteral("Test"));
+
+    // Valid rename
+    panel.renameFolder(fid, QStringLiteral("Renamed"));
+    QCOMPARE(panel.allFolders().first().name, QStringLiteral("Renamed"));
+}
+
+void SessionManagerPanelTest::testDeleteFolderUngroupsSessions()
+{
+    QJsonArray sessions;
+    sessions.append(makeSession(QStringLiteral("s1"), QStringLiteral("konsolai-Test-s1")));
+    writeTestSessions(sessions);
+
+    SessionManagerPanel_INIT(panel);
+    panel.createFolder(QStringLiteral("Fleet"), QColor());
+    QString fid = panel.allFolders().first().folderId;
+
+    panel.moveSessionToFolder(QStringLiteral("s1"), fid);
+    QCOMPARE(panel.sessionMetadata(QStringLiteral("s1"))->folderId, fid);
+
+    panel.deleteFolder(fid);
+    QCOMPARE(panel.allFolders().size(), 0);
+    QVERIFY(panel.sessionMetadata(QStringLiteral("s1"))->folderId.isEmpty());
+}
+
+void SessionManagerPanelTest::testMoveSessionToFolder()
+{
+    QJsonArray sessions;
+    sessions.append(makeSession(QStringLiteral("s1"), QStringLiteral("konsolai-Test-s1")));
+    writeTestSessions(sessions);
+
+    SessionManagerPanel_INIT(panel);
+    panel.createFolder(QStringLiteral("A"), QColor());
+    panel.createFolder(QStringLiteral("B"), QColor());
+    auto folders = panel.allFolders();
+    QCOMPARE(folders.size(), 2);
+
+    QString fidA = folders[0].name == QStringLiteral("A") ? folders[0].folderId : folders[1].folderId;
+    QString fidB = folders[0].name == QStringLiteral("B") ? folders[0].folderId : folders[1].folderId;
+
+    panel.moveSessionToFolder(QStringLiteral("s1"), fidA);
+    QCOMPARE(panel.sessionMetadata(QStringLiteral("s1"))->folderId, fidA);
+
+    // Move to different folder
+    panel.moveSessionToFolder(QStringLiteral("s1"), fidB);
+    QCOMPARE(panel.sessionMetadata(QStringLiteral("s1"))->folderId, fidB);
+}
+
+void SessionManagerPanelTest::testRemoveSessionFromFolder()
+{
+    QJsonArray sessions;
+    sessions.append(makeSession(QStringLiteral("s1"), QStringLiteral("konsolai-Test-s1")));
+    writeTestSessions(sessions);
+
+    SessionManagerPanel_INIT(panel);
+    panel.createFolder(QStringLiteral("F"), QColor());
+    QString fid = panel.allFolders().first().folderId;
+
+    panel.moveSessionToFolder(QStringLiteral("s1"), fid);
+    QVERIFY(!panel.sessionMetadata(QStringLiteral("s1"))->folderId.isEmpty());
+
+    panel.removeSessionFromFolder(QStringLiteral("s1"));
+    QVERIFY(panel.sessionMetadata(QStringLiteral("s1"))->folderId.isEmpty());
+}
+
+void SessionManagerPanelTest::testFolderIdPersistence()
+{
+    // Write sessions with folderId pre-set
+    QJsonArray sessions;
+    QJsonObject s1 = makeSession(QStringLiteral("s1"), QStringLiteral("konsolai-Test-s1"));
+    s1[QStringLiteral("folderId")] = QStringLiteral("folder-abc");
+    sessions.append(s1);
+    writeTestSessions(sessions);
+
+    SessionManagerPanel_INIT(panel);
+    const SessionMetadata *meta = panel.sessionMetadata(QStringLiteral("s1"));
+    QVERIFY(meta);
+    QCOMPARE(meta->folderId, QStringLiteral("folder-abc"));
+}
+
+void SessionManagerPanelTest::testFoldersPersistence()
+{
+    // Create a folder, verify it persists to disk
+    {
+        SessionManagerPanel_INIT(panel);
+        panel.createFolder(QStringLiteral("Persisted"), QColor(0x11, 0x22, 0x33));
+        QCoreApplication::processEvents(); // flush async write
+        QTest::qWait(100); // allow QtConcurrent::run to complete
+    }
+
+    // Re-create panel — should load the folder
+    {
+        SessionManagerPanel_INIT(panel2);
+        QCOMPARE(panel2.allFolders().size(), 1);
+        QCOMPARE(panel2.allFolders().first().name, QStringLiteral("Persisted"));
+    }
+}
+
+void SessionManagerPanelTest::testTreeRoutesGroupedSessionsToFolder()
+{
+    QJsonArray sessions;
+    sessions.append(makeSession(QStringLiteral("s1"), QStringLiteral("konsolai-Test-s1")));
+    sessions.append(makeSession(QStringLiteral("s2"), QStringLiteral("konsolai-Test-s2")));
+    writeTestSessions(sessions);
+
+    SessionManagerPanel_INIT(panel);
+    panel.createFolder(QStringLiteral("MyGroup"), QColor());
+    QString fid = panel.allFolders().first().folderId;
+
+    // Move s1 into the folder
+    panel.moveSessionToFolder(QStringLiteral("s1"), fid);
+    panel.rebuildTreeSync();
+
+    // Find the tree widget
+    auto *tree = panel.findChild<QTreeWidget *>();
+    QVERIFY(tree);
+
+    // Find the folder top-level item
+    QTreeWidgetItem *folderItem = nullptr;
+    for (int i = 0; i < tree->topLevelItemCount(); ++i) {
+        auto *topItem = tree->topLevelItem(i);
+        if (topItem->data(0, Qt::UserRole + 7).toString() == fid) {
+            folderItem = topItem;
+            break;
+        }
+    }
+    QVERIFY(folderItem);
+    QCOMPARE(folderItem->childCount(), 1); // s1 is in the folder
+
+    // Verify s1 is under the folder, not under a category
+    QString childId = folderItem->child(0)->data(0, Qt::UserRole).toString();
+    QCOMPARE(childId, QStringLiteral("s1"));
 }
 
 QTEST_MAIN(SessionManagerPanelTest)

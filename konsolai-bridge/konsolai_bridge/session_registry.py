@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -17,6 +18,7 @@ from typing import Optional
 from .models import (
     ClaudeState,
     SessionDetail,
+    SessionFolderInfo,
     SessionSummary,
     TokenUsage,
     YoloSettings,
@@ -48,10 +50,12 @@ class SessionRegistry:
         sessions_file: Path,
         socket_dir: Path,
         tmux: TmuxManager,
+        folders_file: Path | None = None,
     ) -> None:
         self._sessions_file = sessions_file
         self._socket_dir = socket_dir
         self._tmux = tmux
+        self._folders_file = folders_file or sessions_file.parent / "session_folders.json"
 
         # In-memory state overlay (updated by hook events)
         self._state_cache: dict[str, ClaudeState] = {}
@@ -106,6 +110,7 @@ class SessionRegistry:
                 yolo=self._extract_yolo(meta),
                 created_at=datetime.fromtimestamp(info.created, tz=timezone.utc) if info.created else None,
                 last_activity=self._parse_dt(meta.get("lastActivity")),
+                folder_id=meta.get("folderId"),
             ))
         # Include persisted sessions not currently in tmux (detached/dead)
         for name, meta in persisted.items():
@@ -120,6 +125,7 @@ class SessionRegistry:
                     yolo=self._extract_yolo(meta),
                     created_at=self._parse_dt(meta.get("createdAt")),
                     last_activity=self._parse_dt(meta.get("lastActivity")),
+                    folder_id=meta.get("folderId"),
                 ))
         # Sort: needs-attention first, then by last activity
         results.sort(key=lambda s: (not s.needs_attention, s.last_activity or datetime.min.replace(tzinfo=timezone.utc)), reverse=False)
@@ -159,7 +165,182 @@ class SessionRegistry:
             model=meta.get("model", "default"),
             auto_continue_prompt=meta.get("autoContinuePrompt", ""),
             approval_count=meta.get("approvalCount", 0),
+            folder_id=meta.get("folderId"),
         )
+
+    # ------------------------------------------------------------------
+    # Session folders (groups)
+    # ------------------------------------------------------------------
+
+    def _read_folders(self) -> list[dict]:
+        """Read the session_folders.json file."""
+        if not self._folders_file.exists():
+            return []
+        try:
+            data = json.loads(self._folders_file.read_text())
+            if isinstance(data, list):
+                return data
+        except Exception:
+            logger.warning("Failed to read session_folders.json", exc_info=True)
+        return []
+
+    def _write_folders(self, folders: list[dict]) -> None:
+        """Write the session_folders.json file."""
+        self._folders_file.parent.mkdir(parents=True, exist_ok=True)
+        self._folders_file.write_text(json.dumps(folders, indent=2, default=str) + "\n")
+
+    def _count_members(self, folder_id: str) -> int:
+        """Count how many sessions belong to a folder."""
+        persisted = self._read_persisted()
+        return sum(1 for meta in persisted.values() if meta.get("folderId") == folder_id)
+
+    def list_folders(self) -> list[SessionFolderInfo]:
+        """Return all session folders."""
+        raw = self._read_folders()
+        results: list[SessionFolderInfo] = []
+        for f in raw:
+            fid = f.get("folderId", "")
+            results.append(SessionFolderInfo(
+                folder_id=fid,
+                name=f.get("name", ""),
+                color=f.get("color", ""),
+                created_at=self._parse_dt(f.get("createdAt")),
+                sort_order=f.get("sortOrder", 0),
+                member_count=self._count_members(fid),
+            ))
+        results.sort(key=lambda f: f.sort_order)
+        return results
+
+    def create_folder(self, name: str, color: str = "") -> SessionFolderInfo:
+        """Create a new session folder."""
+        folders = self._read_folders()
+        folder_id = uuid.uuid4().hex[:12]
+        now = datetime.now(tz=timezone.utc)
+        max_order = max((f.get("sortOrder", 0) for f in folders), default=0)
+        entry = {
+            "folderId": folder_id,
+            "name": name,
+            "color": color,
+            "createdAt": now.isoformat(),
+            "sortOrder": max_order + 1,
+        }
+        folders.append(entry)
+        self._write_folders(folders)
+        return SessionFolderInfo(
+            folder_id=folder_id,
+            name=name,
+            color=color,
+            created_at=now,
+            sort_order=max_order + 1,
+            member_count=0,
+        )
+
+    def update_folder(
+        self,
+        folder_id: str,
+        name: str | None = None,
+        color: str | None = None,
+        sort_order: int | None = None,
+    ) -> SessionFolderInfo | None:
+        """Update an existing session folder. Returns None if not found."""
+        folders = self._read_folders()
+        for f in folders:
+            if f.get("folderId") == folder_id:
+                if name is not None:
+                    f["name"] = name
+                if color is not None:
+                    f["color"] = color
+                if sort_order is not None:
+                    f["sortOrder"] = sort_order
+                self._write_folders(folders)
+                return SessionFolderInfo(
+                    folder_id=folder_id,
+                    name=f.get("name", ""),
+                    color=f.get("color", ""),
+                    created_at=self._parse_dt(f.get("createdAt")),
+                    sort_order=f.get("sortOrder", 0),
+                    member_count=self._count_members(folder_id),
+                )
+        return None
+
+    def delete_folder(self, folder_id: str) -> bool:
+        """Delete a folder and clear folderId from all its member sessions.
+
+        Returns True if the folder was found and deleted.
+        """
+        folders = self._read_folders()
+        new_folders = [f for f in folders if f.get("folderId") != folder_id]
+        if len(new_folders) == len(folders):
+            return False
+        self._write_folders(new_folders)
+        # Clear folderId from sessions
+        self._clear_folder_from_sessions(folder_id)
+        return True
+
+    def move_session_to_folder(self, session_id: str, folder_id: str) -> bool:
+        """Assign a session to a folder. Returns False if session not found."""
+        return self._set_session_folder(session_id, folder_id)
+
+    def remove_session_from_folder(self, session_id: str) -> bool:
+        """Remove a session from its folder. Returns False if session not found."""
+        return self._set_session_folder(session_id, None)
+
+    def _set_session_folder(self, session_name: str, folder_id: str | None) -> bool:
+        """Set or clear the folderId for a session in sessions.json."""
+        if not self._sessions_file.exists():
+            return False
+        try:
+            raw = self._sessions_file.read_text()
+            data = json.loads(raw)
+        except Exception:
+            return False
+
+        found = False
+        if isinstance(data, list):
+            for entry in data:
+                if entry.get("name") == session_name:
+                    if folder_id is not None:
+                        entry["folderId"] = folder_id
+                    else:
+                        entry.pop("folderId", None)
+                    found = True
+                    break
+        elif isinstance(data, dict):
+            if session_name in data:
+                if folder_id is not None:
+                    data[session_name]["folderId"] = folder_id
+                else:
+                    data[session_name].pop("folderId", None)
+                found = True
+
+        if found:
+            self._sessions_file.write_text(json.dumps(data, indent=2, default=str) + "\n")
+        return found
+
+    def _clear_folder_from_sessions(self, folder_id: str) -> None:
+        """Remove a specific folderId from all sessions."""
+        if not self._sessions_file.exists():
+            return
+        try:
+            raw = self._sessions_file.read_text()
+            data = json.loads(raw)
+        except Exception:
+            return
+
+        changed = False
+        if isinstance(data, list):
+            for entry in data:
+                if entry.get("folderId") == folder_id:
+                    entry.pop("folderId", None)
+                    changed = True
+        elif isinstance(data, dict):
+            for meta in data.values():
+                if isinstance(meta, dict) and meta.get("folderId") == folder_id:
+                    meta.pop("folderId", None)
+                    changed = True
+
+        if changed:
+            self._sessions_file.write_text(json.dumps(data, indent=2, default=str) + "\n")
 
     # ------------------------------------------------------------------
     # Internal helpers

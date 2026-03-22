@@ -19,6 +19,7 @@
 #include <QCheckBox>
 #include <QClipboard>
 #include <QColor>
+#include <QColorDialog>
 #include <QComboBox>
 #include <QDesktopServices>
 #include <QDialog>
@@ -51,6 +52,7 @@
 #include <QStandardPaths>
 #include <QToolBar>
 #include <QUrl>
+#include <QUuid>
 #include <QVBoxLayout>
 #include <QtConcurrent>
 
@@ -101,6 +103,7 @@ SessionManagerPanel::SessionManagerPanel(QWidget *parent)
 void SessionManagerPanel::deferredInit()
 {
     loadMetadata();
+    loadFolders();
     cleanupStaleSockets(); // async — returns immediately
     refreshRemoteTmuxSessions(); // async SSH query for remote session liveness
     refresh(); // async — returns immediately
@@ -1392,6 +1395,12 @@ void SessionManagerPanel::onItemDoubleClicked(QTreeWidgetItem *item, int column)
         return;
     }
 
+    // Folder header — toggle expand/collapse
+    if (!item->data(0, Qt::UserRole + 7).toString().isEmpty() && item->parent() == nullptr) {
+        item->setExpanded(!item->isExpanded());
+        return;
+    }
+
     // Check if this is a subagent/subprocess child item (parent is a session item, not a category)
     QTreeWidgetItem *parentItem = item->parent();
     if (parentItem && parentItem->parent() != nullptr) {
@@ -1503,7 +1512,7 @@ void SessionManagerPanel::onItemDoubleClicked(QTreeWidgetItem *item, int column)
         if (session) {
             Q_EMIT focusSessionRequested(session);
         }
-    } else if (item->parent() == m_closedCategory) {
+    } else if (item->parent() == m_closedCategory || meta.isExpired) {
         // Closed session — tmux is dead, recreate like unarchive
         unarchiveSession(sessionId);
     } else {
@@ -1685,6 +1694,51 @@ void SessionManagerPanel::onContextMenu(const QPoint &pos)
             menu.exec(m_treeWidget->viewport()->mapToGlobal(pos));
         }
         return;
+    }
+
+    // Folder header context menu
+    {
+        QString folderId = item->data(0, Qt::UserRole + 7).toString();
+        if (!folderId.isEmpty() && m_folders.contains(folderId) && item->parent() == nullptr) {
+            QMenu menu(this);
+
+            QAction *renameAction = menu.addAction(QIcon::fromTheme(QStringLiteral("edit-rename")), i18n("Rename Folder..."));
+            connect(renameAction, &QAction::triggered, this, [this, folderId]() {
+                bool ok;
+                QString current = m_folders[folderId].name;
+                QString newName = QInputDialog::getText(this, i18n("Rename Folder"),
+                    i18n("Folder name:"), QLineEdit::Normal, current, &ok);
+                if (ok && !newName.isEmpty()) {
+                    renameFolder(folderId, newName);
+                }
+            });
+
+            QAction *colorAction = menu.addAction(QIcon::fromTheme(QStringLiteral("color-picker")), i18n("Change Color..."));
+            connect(colorAction, &QAction::triggered, this, [this, folderId]() {
+                QColor current = m_folders[folderId].color;
+                QColor newColor = QColorDialog::getColor(current, this, i18n("Folder Color"));
+                if (newColor.isValid()) {
+                    setFolderColor(folderId, newColor);
+                }
+            });
+
+            menu.addSeparator();
+
+            QAction *deleteAction = menu.addAction(QIcon::fromTheme(QStringLiteral("edit-delete")), i18n("Delete Folder"));
+            connect(deleteAction, &QAction::triggered, this, [this, folderId]() {
+                int count = m_folderTreeItems.contains(folderId) ? m_folderTreeItems[folderId]->childCount() : 0;
+                auto answer = QMessageBox::question(this, i18n("Delete Folder"),
+                    i18n("Delete folder '%1'? Its %2 sessions will become ungrouped.",
+                         m_folders[folderId].name, count),
+                    QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+                if (answer == QMessageBox::Yes) {
+                    deleteFolder(folderId);
+                }
+            });
+
+            menu.exec(m_treeWidget->viewport()->mapToGlobal(pos));
+            return;
+        }
     }
 
     // Handle items deeper than direct children of categories (subagents, subprocesses, task/prompt groups)
@@ -2380,6 +2434,78 @@ void SessionManagerPanel::onContextMenu(const QPoint &pos)
             connect(showAgentAction, &QAction::triggered, this, [this, agentIdCopy]() {
                 Q_EMIT showAgentRequested(agentIdCopy);
             });
+
+            // Group All Agent Sessions — creates a folder with all sessions from this agent
+            QAction *groupAgentAction = menu.addAction(QIcon::fromTheme(QStringLiteral("folder-new")), i18n("Group All '%1' Sessions", meta.agentId));
+            connect(groupAgentAction, &QAction::triggered, this, [this, agentIdCopy]() {
+                createFolder(agentIdCopy, QColor());
+                // Find the just-created folder (most recent by createdAt)
+                QString newestFolderId;
+                QDateTime newest;
+                for (auto fit = m_folders.constBegin(); fit != m_folders.constEnd(); ++fit) {
+                    if (fit->createdAt > newest) {
+                        newest = fit->createdAt;
+                        newestFolderId = fit.key();
+                    }
+                }
+                if (newestFolderId.isEmpty()) {
+                    return;
+                }
+                for (auto &m : m_metadata) {
+                    if (m.agentId == agentIdCopy) {
+                        m.folderId = newestFolderId;
+                    }
+                }
+                scheduleMetadataSave();
+                scheduleTreeUpdate();
+            });
+        }
+
+        // Move to Folder submenu
+        {
+            QMenu *folderMenu = menu.addMenu(QIcon::fromTheme(QStringLiteral("folder")), i18n("Move to Folder"));
+
+            if (!meta.folderId.isEmpty()) {
+                QAction *removeAction = folderMenu->addAction(i18n("Remove from Folder"));
+                connect(removeAction, &QAction::triggered, this, [this, sessionId]() {
+                    removeSessionFromFolder(sessionId);
+                });
+                folderMenu->addSeparator();
+            }
+
+            for (auto it = m_folders.constBegin(); it != m_folders.constEnd(); ++it) {
+                if (it.key() == meta.folderId) {
+                    continue; // Already in this folder
+                }
+                QAction *moveAction = folderMenu->addAction(QIcon::fromTheme(QStringLiteral("folder")), it->name);
+                QString targetFolderId = it.key();
+                connect(moveAction, &QAction::triggered, this, [this, sessionId, targetFolderId]() {
+                    moveSessionToFolder(sessionId, targetFolderId);
+                });
+            }
+
+            folderMenu->addSeparator();
+            QAction *newFolderAction = folderMenu->addAction(QIcon::fromTheme(QStringLiteral("folder-new")), i18n("New Folder..."));
+            connect(newFolderAction, &QAction::triggered, this, [this, sessionId]() {
+                bool ok;
+                QString name = QInputDialog::getText(this, i18n("New Folder"),
+                    i18n("Folder name:"), QLineEdit::Normal, QString(), &ok);
+                if (ok && !name.isEmpty()) {
+                    createFolder(name, QColor());
+                    // Find newest folder and move session into it
+                    QString newestFolderId;
+                    QDateTime newest;
+                    for (auto fit = m_folders.constBegin(); fit != m_folders.constEnd(); ++fit) {
+                        if (fit->createdAt > newest) {
+                            newest = fit->createdAt;
+                            newestFolderId = fit.key();
+                        }
+                    }
+                    if (!newestFolderId.isEmpty()) {
+                        moveSessionToFolder(sessionId, newestFolderId);
+                    }
+                }
+            });
         }
 
         menu.addSeparator();
@@ -2852,6 +2978,37 @@ void SessionManagerPanel::updateTreeWidgetWithLiveSessions(const QSet<QString> &
         delete m_dismissedCategory->takeChild(0);
     }
 
+    // Clear and recreate folder top-level items
+    for (auto *folderItem : std::as_const(m_folderTreeItems)) {
+        int idx = m_treeWidget->indexOfTopLevelItem(folderItem);
+        if (idx >= 0) {
+            delete m_treeWidget->takeTopLevelItem(idx);
+        }
+    }
+    m_folderTreeItems.clear();
+
+    // Create folder items sorted by sortOrder, inserted BEFORE category items
+    QList<SessionFolderInfo> sortedFolders = m_folders.values();
+    std::sort(sortedFolders.begin(), sortedFolders.end(),
+        [](const SessionFolderInfo &a, const SessionFolderInfo &b) {
+            return a.sortOrder < b.sortOrder;
+        });
+    int folderInsertIdx = 0;
+    for (const auto &folder : std::as_const(sortedFolders)) {
+        auto *folderItem = new QTreeWidgetItem();
+        folderItem->setText(0, folder.name);
+        folderItem->setIcon(0, QIcon::fromTheme(QStringLiteral("folder")));
+        if (folder.color.isValid()) {
+            folderItem->setForeground(0, QBrush(folder.color));
+        }
+        folderItem->setFlags(Qt::ItemIsEnabled);
+        folderItem->setData(0, Qt::UserRole + 7, folder.folderId);
+        folderItem->setData(0, Qt::UserRole + 6, QStringLiteral("f:%1").arg(folder.folderId));
+        folderItem->setExpanded(true);
+        m_treeWidget->insertTopLevelItem(folderInsertIdx++, folderItem);
+        m_folderTreeItems[folder.folderId] = folderItem;
+    }
+
     // Note: We no longer auto-archive dead tmux sessions.
     // Dead sessions go to "Closed", user-archived sessions go to "Archived".
 
@@ -2897,6 +3054,13 @@ void SessionManagerPanel::updateTreeWidgetWithLiveSessions(const QSet<QString> &
         if (wasClosed && !tmuxAlive) {
             m_explicitlyClosed.remove(meta.sessionId);
             wasClosed = false; // already categorized correctly via tmuxAlive=false
+        }
+
+        // Route to folder if session is in one, otherwise to lifecycle category
+        if (!meta.folderId.isEmpty() && m_folderTreeItems.contains(meta.folderId)) {
+            QTreeWidgetItem *folderParent = m_folderTreeItems[meta.folderId];
+            addSessionToTree(meta, folderParent, false);
+            continue;
         }
 
         QString cat;
@@ -2970,9 +3134,26 @@ void SessionManagerPanel::updateTreeWidgetWithLiveSessions(const QSet<QString> &
     updateCategory(m_dismissedCategory, i18n("Dismissed"));
     updateCategory(m_discoveredCategory, i18n("Discovered"));
 
+    // Update folder headers with member count
+    for (auto it = m_folderTreeItems.constBegin(); it != m_folderTreeItems.constEnd(); ++it) {
+        QTreeWidgetItem *folderItem = it.value();
+        int count = folderItem->childCount();
+        const auto &folder = m_folders[it.key()];
+        folderItem->setHidden(count == 0);
+        if (count > 0) {
+            folderItem->setText(0, QStringLiteral("%1 (%2)").arg(folder.name).arg(count));
+        } else {
+            folderItem->setText(0, folder.name);
+        }
+    }
+
     // Show empty state if no sessions at all
     int totalChildren = m_pinnedCategory->childCount() + m_activeCategory->childCount() + m_detachedCategory->childCount()
         + m_closedCategory->childCount() + m_archivedCategory->childCount() + m_dismissedCategory->childCount() + m_discoveredCategory->childCount();
+    // Include folder children in total count
+    for (auto *folderItem : std::as_const(m_folderTreeItems)) {
+        totalChildren += folderItem->childCount();
+    }
     m_emptyStateLabel->setVisible(totalChildren == 0);
 
     // Re-apply active filter after tree rebuild
@@ -2994,8 +3175,12 @@ void SessionManagerPanel::applyFilter(const QString &text)
     }
 
     // Iterate all category items, show/hide children based on filter match
-    const QList<QTreeWidgetItem *> categories = {m_pinnedCategory, m_activeCategory,    m_detachedCategory,  m_closedCategory,
+    QList<QTreeWidgetItem *> categories = {m_pinnedCategory, m_activeCategory,    m_detachedCategory,  m_closedCategory,
                                                   m_archivedCategory, m_dismissedCategory, m_discoveredCategory};
+    // Include folder items in filtering
+    for (auto *folderItem : std::as_const(m_folderTreeItems)) {
+        categories.append(folderItem);
+    }
 
     for (auto *cat : categories) {
         if (!cat) {
@@ -3204,6 +3389,22 @@ void SessionManagerPanel::addSessionToTree(const SessionMetadata &meta, QTreeWid
     // Muted indicator
     if (m_mutedSessions.contains(meta.sessionId)) {
         displayName += QStringLiteral(" [muted]");
+    }
+
+    // For folder-grouped sessions, prepend lifecycle state indicator
+    QString parentFolderId = parent->data(0, Qt::UserRole + 7).toString();
+    if (!parentFolderId.isEmpty()) {
+        bool tmuxAlive = m_cachedLiveNames.contains(meta.sessionName)
+            || (meta.isRemote && m_cachedRemoteLiveNames.contains(meta.sessionName));
+        if (isActive) {
+            displayName = QStringLiteral("\u25B6 ") + displayName; // ▶ active
+        } else if (tmuxAlive) {
+            displayName = QStringLiteral("\u23F8 ") + displayName; // ⏸ detached
+        } else if (meta.isArchived) {
+            displayName = QStringLiteral("\U0001F4E6 ") + displayName; // 📦 archived
+        } else {
+            displayName = QStringLiteral("\u2716 ") + displayName; // ✖ closed
+        }
     }
 
     item->setText(0, displayName);
@@ -3859,6 +4060,7 @@ void SessionManagerPanel::loadMetadata()
         meta.lastResumeSessionId = obj[QStringLiteral("lastResumeSessionId")].toString();
         meta.description = obj[QStringLiteral("description")].toString();
         meta.agentId = obj[QStringLiteral("agentId")].toString();
+        meta.folderId = obj[QStringLiteral("folderId")].toString();
 
         // Budget settings
         meta.budgetTimeLimitMinutes = obj[QStringLiteral("budgetTimeLimitMinutes")].toInt();
@@ -3990,6 +4192,9 @@ void SessionManagerPanel::saveMetadata(bool sync)
         if (!meta.agentId.isEmpty()) {
             obj[QStringLiteral("agentId")] = meta.agentId;
         }
+        if (!meta.folderId.isEmpty()) {
+            obj[QStringLiteral("folderId")] = meta.folderId;
+        }
 
         // Budget settings (only save if any limit is set)
         if (meta.budgetTimeLimitMinutes > 0) {
@@ -4054,6 +4259,158 @@ void SessionManagerPanel::saveMetadata(bool sync)
     }
 
     Q_EMIT usageAggregateChanged();
+}
+
+void SessionManagerPanel::loadFolders()
+{
+    QString dataPath = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    QString filePath = dataPath + QStringLiteral("/session_folders.json");
+
+    QFile file(filePath);
+    if (!file.open(QIODevice::ReadOnly)) {
+        return;
+    }
+
+    QJsonParseError parseError;
+    QJsonDocument doc = QJsonDocument::fromJson(file.readAll(), &parseError);
+    if (parseError.error != QJsonParseError::NoError || !doc.isArray()) {
+        qWarning() << "SessionManagerPanel::loadFolders: parse error in" << filePath;
+        return;
+    }
+
+    QJsonArray array = doc.array();
+    for (const auto &value : array) {
+        QJsonObject obj = value.toObject();
+        SessionFolderInfo folder;
+        folder.folderId = obj[QStringLiteral("folderId")].toString();
+        folder.name = obj[QStringLiteral("name")].toString();
+        folder.color = QColor(obj[QStringLiteral("color")].toString());
+        folder.createdAt = QDateTime::fromString(obj[QStringLiteral("createdAt")].toString(), Qt::ISODate);
+        folder.sortOrder = obj[QStringLiteral("sortOrder")].toInt();
+        if (!folder.folderId.isEmpty() && !folder.name.isEmpty()) {
+            m_folders[folder.folderId] = folder;
+        }
+    }
+}
+
+void SessionManagerPanel::saveFolders()
+{
+    QString dataPath = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    QDir().mkpath(dataPath);
+    QString filePath = dataPath + QStringLiteral("/session_folders.json");
+
+    QJsonArray array;
+    for (const auto &folder : std::as_const(m_folders)) {
+        QJsonObject obj;
+        obj[QStringLiteral("folderId")] = folder.folderId;
+        obj[QStringLiteral("name")] = folder.name;
+        if (folder.color.isValid()) {
+            obj[QStringLiteral("color")] = folder.color.name();
+        }
+        obj[QStringLiteral("createdAt")] = folder.createdAt.toString(Qt::ISODate);
+        obj[QStringLiteral("sortOrder")] = folder.sortOrder;
+        array.append(obj);
+    }
+
+    QJsonDocument doc(array);
+    QByteArray json = doc.toJson(QJsonDocument::Indented);
+    (void)QtConcurrent::run([filePath, json]() {
+        QFile file(filePath);
+        if (file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            file.write(json);
+            file.close();
+        } else {
+            qWarning() << "SessionManagerPanel::saveFolders: Failed to write" << filePath;
+        }
+    });
+}
+
+void SessionManagerPanel::createFolder(const QString &name, const QColor &color)
+{
+    SessionFolderInfo folder;
+    folder.folderId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    folder.name = name;
+    folder.color = color;
+    folder.createdAt = QDateTime::currentDateTime();
+    // Place new folder after existing ones
+    int maxOrder = 0;
+    for (const auto &f : std::as_const(m_folders)) {
+        maxOrder = qMax(maxOrder, f.sortOrder);
+    }
+    folder.sortOrder = maxOrder + 1;
+    m_folders[folder.folderId] = folder;
+
+    saveFolders();
+    scheduleTreeUpdate();
+    Q_EMIT foldersChanged();
+}
+
+void SessionManagerPanel::renameFolder(const QString &folderId, const QString &newName)
+{
+    if (!m_folders.contains(folderId) || newName.isEmpty()) {
+        return;
+    }
+    m_folders[folderId].name = newName;
+    saveFolders();
+    scheduleTreeUpdate();
+    Q_EMIT foldersChanged();
+}
+
+void SessionManagerPanel::setFolderColor(const QString &folderId, const QColor &color)
+{
+    if (!m_folders.contains(folderId)) {
+        return;
+    }
+    m_folders[folderId].color = color;
+    saveFolders();
+    scheduleTreeUpdate();
+    Q_EMIT foldersChanged();
+}
+
+void SessionManagerPanel::deleteFolder(const QString &folderId)
+{
+    if (!m_folders.contains(folderId)) {
+        return;
+    }
+    // Ungroup all member sessions
+    for (auto &meta : m_metadata) {
+        if (meta.folderId == folderId) {
+            meta.folderId.clear();
+        }
+    }
+    m_folders.remove(folderId);
+
+    saveFolders();
+    scheduleMetadataSave();
+    scheduleTreeUpdate();
+    Q_EMIT foldersChanged();
+}
+
+void SessionManagerPanel::moveSessionToFolder(const QString &sessionId, const QString &folderId)
+{
+    auto *meta = findMetadata(sessionId);
+    if (!meta || !m_folders.contains(folderId)) {
+        return;
+    }
+    meta->folderId = folderId;
+    scheduleMetadataSave();
+    scheduleTreeUpdate();
+}
+
+void SessionManagerPanel::removeSessionFromFolder(const QString &sessionId)
+{
+    auto *meta = findMetadata(sessionId);
+    if (!meta || meta->folderId.isEmpty()) {
+        return;
+    }
+    meta->folderId.clear();
+    scheduleMetadataSave();
+    scheduleTreeUpdate();
+}
+
+QList<SessionFolderInfo> SessionManagerPanel::allFolders() const
+{
+    return m_folders.values();
 }
 
 // Compute incremental cost within a time window from cumulative approval log entries.
@@ -4896,9 +5253,14 @@ void SessionManagerPanel::saveTreeState()
     };
 
     for (int i = 0; i < m_treeWidget->topLevelItemCount(); ++i) {
-        QTreeWidgetItem *category = m_treeWidget->topLevelItem(i);
-        for (int j = 0; j < category->childCount(); ++j) {
-            walkItem(category->child(j), walkItem);
+        QTreeWidgetItem *topItem = m_treeWidget->topLevelItem(i);
+        // Save expansion for the top-level item itself (folder items need this)
+        QString topKey = compositeKeyForItem(topItem);
+        if (!topKey.isEmpty()) {
+            m_expansionState[topKey] = topItem->isExpanded();
+        }
+        for (int j = 0; j < topItem->childCount(); ++j) {
+            walkItem(topItem->child(j), walkItem);
         }
     }
 }
@@ -4926,9 +5288,27 @@ void SessionManagerPanel::restoreTreeState()
             }
         };
         for (int i = 0; i < m_treeWidget->topLevelItemCount() && !found; ++i) {
-            QTreeWidgetItem *cat = m_treeWidget->topLevelItem(i);
-            for (int j = 0; j < cat->childCount() && !found; ++j) {
-                walkRestore(cat->child(j), walkRestore);
+            QTreeWidgetItem *topItem = m_treeWidget->topLevelItem(i);
+            // Check top-level item itself (for folder items)
+            if (compositeKeyForItem(topItem) == m_savedSelectedKey) {
+                m_treeWidget->setCurrentItem(topItem);
+                found = true;
+                break;
+            }
+            for (int j = 0; j < topItem->childCount() && !found; ++j) {
+                walkRestore(topItem->child(j), walkRestore);
+            }
+        }
+    }
+
+    // Restore expansion state for top-level folder items
+    for (int i = 0; i < m_treeWidget->topLevelItemCount(); ++i) {
+        QTreeWidgetItem *topItem = m_treeWidget->topLevelItem(i);
+        QString topKey = compositeKeyForItem(topItem);
+        if (!topKey.isEmpty()) {
+            auto it = m_expansionState.constFind(topKey);
+            if (it != m_expansionState.constEnd()) {
+                topItem->setExpanded(it.value());
             }
         }
     }
