@@ -125,9 +125,16 @@ async def register_session(name: str, metadata: str | None = None) -> Session:
                     f"Session name '{name}' is already registered and active "
                     f"(last heartbeat {age_seconds}s ago). Choose a different name."
                 )
-            # Replace stale session
+            # Replace stale session — clear FK references first
             old_id = row[0]["id"]
             await db.execute("DELETE FROM read_cursors WHERE session_id = ?", (old_id,))
+            await db.execute("UPDATE messages SET recipient_id = NULL WHERE recipient_id = ?", (old_id,))
+            # Detach thread replies pointing at messages we're about to delete
+            await db.execute(
+                "UPDATE messages SET thread_id = NULL WHERE thread_id IN "
+                "(SELECT id FROM messages WHERE sender_id = ?)", (old_id,)
+            )
+            await db.execute("DELETE FROM messages WHERE sender_id = ?", (old_id,))
             await db.execute("DELETE FROM sessions WHERE id = ?", (old_id,))
 
         session_id = str(uuid.uuid4())
@@ -505,6 +512,14 @@ async def _cleanup_stale(db: aiosqlite.Connection, ttl_minutes: int) -> list[str
     removed = []
     for r in rows:
         await db.execute("DELETE FROM read_cursors WHERE session_id = ?", (r["id"],))
+        # Clear message FK references before deleting session
+        await db.execute("UPDATE messages SET recipient_id = NULL WHERE recipient_id = ?", (r["id"],))
+        # Detach thread replies pointing at messages we're about to delete
+        await db.execute(
+            "UPDATE messages SET thread_id = NULL WHERE thread_id IN "
+            "(SELECT id FROM messages WHERE sender_id = ?)", (r["id"],)
+        )
+        await db.execute("DELETE FROM messages WHERE sender_id = ?", (r["id"],))
         await db.execute("DELETE FROM sessions WHERE id = ?", (r["id"],))
         removed.append(r["name"])
     if removed:

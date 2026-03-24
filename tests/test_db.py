@@ -236,3 +236,57 @@ async def test_broadcast_nonexistent_channel():
     await db.register_session("alice")
     with pytest.raises(ValueError, match="not found"):
         await db.broadcast_message("alice", "hello", channel="nonexistent")
+
+
+@pytest.mark.asyncio
+async def test_cleanup_with_thread_replies():
+    """Regression: cleanup must not FK-fail when stale session's messages have thread replies."""
+    await db.init_db()
+    alice = await db.register_session("alice")
+    await db.register_session("bob")
+
+    # Alice sends a message, Bob replies in a thread
+    msg = await db.send_message("alice", "bob", "hello")
+    await db.send_message("bob", "alice", "reply", thread_id=msg.id)
+
+    # Make Alice stale
+    conn = await db.get_connection()
+    try:
+        await conn.execute(
+            "UPDATE sessions SET last_heartbeat = datetime('now', '-60 minutes') WHERE id = ?",
+            (alice.id,),
+        )
+        await conn.commit()
+    finally:
+        await conn.close()
+
+    # Cleanup should NOT raise FK constraint error
+    removed = await db.cleanup_sessions(ttl_minutes=30)
+    assert "alice" in removed
+
+
+@pytest.mark.asyncio
+async def test_register_replaces_stale_with_threads():
+    """Regression: re-registering a stale session must handle thread FK refs."""
+    await db.init_db()
+    alice = await db.register_session("alice")
+    await db.register_session("bob")
+
+    msg = await db.send_message("alice", "bob", "original")
+    await db.send_message("bob", "alice", "threaded reply", thread_id=msg.id)
+
+    # Make Alice stale
+    conn = await db.get_connection()
+    try:
+        await conn.execute(
+            "UPDATE sessions SET last_heartbeat = datetime('now', '-60 minutes') WHERE id = ?",
+            (alice.id,),
+        )
+        await conn.commit()
+    finally:
+        await conn.close()
+
+    # Re-registering should NOT raise FK constraint error
+    new_alice = await db.register_session("alice")
+    assert new_alice.name == "alice"
+    assert new_alice.id != alice.id
