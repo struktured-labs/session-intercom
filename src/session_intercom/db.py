@@ -7,6 +7,7 @@ from pathlib import Path
 
 import aiosqlite
 
+from .inbox import write_to_inbox
 from .models import Channel, Message, Session
 
 DB_DIR = Path.home() / ".local" / "share" / "session-intercom"
@@ -64,6 +65,10 @@ CREATE INDEX IF NOT EXISTS idx_sessions_heartbeat ON sessions(last_heartbeat);
 CREATE INDEX IF NOT EXISTS idx_sessions_name ON sessions(name);
 """
 
+MIGRATION_TEAM_NAME = """\
+ALTER TABLE sessions ADD COLUMN team_name TEXT;
+"""
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
@@ -96,6 +101,11 @@ async def init_db() -> None:
     db = await get_connection()
     try:
         await db.executescript(SCHEMA)
+        # Migrate: add team_name column if missing
+        cursor = await db.execute("PRAGMA table_info(sessions)")
+        columns = {row[1] for row in await cursor.fetchall()}
+        if "team_name" not in columns:
+            await db.executescript(MIGRATION_TEAM_NAME)
         await db.commit()
     finally:
         await db.close()
@@ -104,8 +114,12 @@ async def init_db() -> None:
 # --- Sessions ---
 
 
-async def register_session(name: str, metadata: str | None = None) -> Session:
+async def register_session(
+    name: str, metadata: str | None = None, team_name: str | None = None
+) -> Session:
     validate_name(name)
+    if team_name is not None:
+        validate_name(team_name)
     db = await get_connection()
     try:
         # Check if name already taken
@@ -140,11 +154,15 @@ async def register_session(name: str, metadata: str | None = None) -> Session:
         session_id = str(uuid.uuid4())
         now = _now()
         await db.execute(
-            "INSERT INTO sessions (id, name, created_at, last_heartbeat, metadata) VALUES (?, ?, ?, ?, ?)",
-            (session_id, name, now, now, metadata),
+            "INSERT INTO sessions (id, name, created_at, last_heartbeat, metadata, team_name)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (session_id, name, now, now, metadata, team_name),
         )
         await db.commit()
-        return Session(id=session_id, name=name, created_at=now, last_heartbeat=now, metadata=metadata)
+        return Session(
+            id=session_id, name=name, created_at=now,
+            last_heartbeat=now, metadata=metadata, team_name=team_name,
+        )
     finally:
         await db.close()
 
@@ -162,7 +180,8 @@ async def heartbeat(name: str) -> Session:
             raise ValueError(f"Session '{name}' not found")
         r = row[0]
         return Session(id=r["id"], name=r["name"], created_at=r["created_at"],
-                       last_heartbeat=r["last_heartbeat"], metadata=r["metadata"])
+                       last_heartbeat=r["last_heartbeat"], metadata=r["metadata"],
+                       team_name=r["team_name"])
     finally:
         await db.close()
 
@@ -181,7 +200,8 @@ async def list_sessions(include_stale: bool = False) -> list[Session]:
             )
         return [
             Session(id=r["id"], name=r["name"], created_at=r["created_at"],
-                    last_heartbeat=r["last_heartbeat"], metadata=r["metadata"])
+                    last_heartbeat=r["last_heartbeat"], metadata=r["metadata"],
+                    team_name=r["team_name"])
             for r in rows
         ]
     finally:
@@ -222,6 +242,13 @@ async def send_message(
         row = await db.execute_fetchall("SELECT created_at FROM messages WHERE id = ?", (msg_id,))
         created_at = row[0]["created_at"] if row else _now()
 
+        # Bridge to native inbox if recipient has a team
+        if recipient.get("team_name"):
+            write_to_inbox(
+                recipient["team_name"], from_name, body,
+                summary=f"intercom DM from {from_name}",
+            )
+
         return Message(
             id=msg_id, sender_id=sender["id"], sender_name=from_name,
             recipient_id=recipient["id"], recipient_name=to_name,
@@ -258,6 +285,17 @@ async def broadcast_message(
 
         row = await db.execute_fetchall("SELECT created_at FROM messages WHERE id = ?", (msg_id,))
         created_at = row[0]["created_at"] if row else _now()
+
+        # Bridge broadcast to native inboxes for all sessions with teams (except sender)
+        team_rows = await db.execute_fetchall(
+            "SELECT team_name FROM sessions WHERE team_name IS NOT NULL AND id != ?",
+            (sender["id"],),
+        )
+        for tr in team_rows:
+            write_to_inbox(
+                tr["team_name"], from_name, body,
+                summary=f"[{channel}] {from_name}",
+            )
 
         return Message(
             id=msg_id, sender_id=sender["id"], sender_name=from_name,

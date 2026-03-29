@@ -32,16 +32,36 @@ def _json(obj) -> str:
 
 
 @mcp.tool()
-async def intercom_register(name: str, metadata: str | None = None) -> str:
+async def intercom_register(
+    name: str, metadata: str | None = None, team_name: str | None = None
+) -> str:
     """Register this session with the intercom system.
+
+    For zero-polling message delivery, first create a personal team with TeamCreate
+    using your session name, then pass that name as team_name here. Messages will be
+    written directly to your native Claude Code inbox — no /loop needed.
+
+    Setup (one-time per session):
+      1. Call TeamCreate with team_name=<your-name>
+      2. Call intercom_register(name=<your-name>, team_name=<your-name>)
 
     Args:
         name: Human-readable session name (alphanumeric/hyphens, 1-64 chars). E.g. "rom-hacker", "fleet-ops".
         metadata: Optional JSON string with arbitrary session info.
+        team_name: Optional Claude Code team name for native inbox delivery. Must match a team you created with TeamCreate.
     """
     try:
-        session = await db.register_session(name, metadata)
-        return _json({"status": "registered", "session": asdict(session)})
+        session = await db.register_session(name, metadata, team_name)
+        result = {"status": "registered", "session": asdict(session)}
+        if team_name:
+            from .inbox import inbox_exists
+            result["native_inbox"] = inbox_exists(team_name)
+            if not result["native_inbox"]:
+                result["warning"] = (
+                    f"Team '{team_name}' inbox not found. "
+                    "Make sure you called TeamCreate first."
+                )
+        return _json(result)
     except ValueError as e:
         return _json({"error": str(e)})
 
@@ -91,7 +111,8 @@ async def intercom_poll(
 ) -> str:
     """Poll for new/unread messages. Also updates your heartbeat.
 
-    This is the primary way to receive messages. Use with /loop for continuous polling.
+    If you registered with a team_name, messages are delivered to your native inbox
+    automatically — you only need this for checking history or if not using native delivery.
 
     Args:
         name: Your registered session name.

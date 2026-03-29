@@ -10,6 +10,7 @@ class Session:
     created_at: str
     last_heartbeat: str
     metadata: str | None = None
+    team_name: str | None = None
 
 
 @dataclass
