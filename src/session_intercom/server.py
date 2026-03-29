@@ -54,11 +54,11 @@ async def intercom_register(
         session = await db.register_session(name, metadata, team_name)
         result = {"status": "registered", "session": asdict(session)}
         if team_name:
-            from .inbox import inbox_exists
-            result["native_inbox"] = inbox_exists(team_name)
+            from .inbox import ensure_inbox
+            result["native_inbox"] = ensure_inbox(team_name)
             if not result["native_inbox"]:
                 result["warning"] = (
-                    f"Team '{team_name}' inbox not found. "
+                    f"Team '{team_name}' config not found. "
                     "Make sure you called TeamCreate first."
                 )
         return _json(result)

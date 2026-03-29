@@ -82,3 +82,25 @@ def write_to_inbox(
 def inbox_exists(team_name: str) -> bool:
     """Check if a team's inbox directory exists (team was created by CLI)."""
     return _inbox_path(team_name).parent.exists()
+
+
+def ensure_inbox(team_name: str) -> bool:
+    """Create the inboxes dir and empty inbox file if the team config exists but inboxes don't.
+
+    TeamCreate creates config.json but not the inboxes dir — that normally
+    happens when the first teammate is spawned. We create it eagerly so the
+    InboxPoller has something to watch immediately.
+
+    Returns True if inbox is ready, False if team config doesn't exist.
+    """
+    team_dir = CLAUDE_TEAMS_DIR / team_name
+    config = team_dir / "config.json"
+    if not config.exists():
+        return False
+
+    inbox = _inbox_path(team_name)
+    inbox.parent.mkdir(parents=True, exist_ok=True)
+    if not inbox.exists():
+        inbox.write_text("[]")
+        logger.info("Created inbox file for team %s", team_name)
+    return True

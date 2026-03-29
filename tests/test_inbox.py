@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from session_intercom import db
-from session_intercom.inbox import inbox_exists, write_to_inbox
+from session_intercom.inbox import ensure_inbox, inbox_exists, write_to_inbox
 
 
 @pytest.fixture
@@ -18,16 +18,23 @@ def teams_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     return tmp_path
 
 
-def _create_team(teams_dir: Path, team_name: str) -> Path:
-    """Simulate what TeamCreate does: create the team dir + inboxes dir."""
-    inbox_dir = teams_dir / team_name / "inboxes"
-    inbox_dir.mkdir(parents=True)
-    # Write minimal team config
-    config = teams_dir / team_name / "config.json"
+def _create_team_config_only(teams_dir: Path, team_name: str) -> Path:
+    """Simulate what TeamCreate actually does: config.json only, NO inboxes dir."""
+    team_dir = teams_dir / team_name
+    team_dir.mkdir(parents=True, exist_ok=True)
+    config = team_dir / "config.json"
     config.write_text(json.dumps({
         "name": team_name,
         "members": [{"name": "team-lead", "agentId": f"team-lead@{team_name}"}],
     }))
+    return team_dir
+
+
+def _create_team(teams_dir: Path, team_name: str) -> Path:
+    """Create team config + inboxes dir (full setup)."""
+    _create_team_config_only(teams_dir, team_name)
+    inbox_dir = teams_dir / team_name / "inboxes"
+    inbox_dir.mkdir(parents=True, exist_ok=True)
     return inbox_dir
 
 
@@ -175,3 +182,38 @@ async def test_register_with_team_name(tmp_path, monkeypatch):
 
     sessions = await db.list_sessions(include_stale=True)
     assert sessions[0].team_name == "alice-team"
+
+
+def test_ensure_inbox_creates_dir_and_file(teams_dir):
+    """ensure_inbox creates inboxes/ and team-lead.json when only config exists."""
+    _create_team_config_only(teams_dir, "my-session")
+
+    # Before: no inboxes dir
+    assert not (teams_dir / "my-session" / "inboxes").exists()
+
+    result = ensure_inbox("my-session")
+    assert result is True
+
+    # After: inbox file exists with empty array
+    inbox_file = teams_dir / "my-session" / "inboxes" / "team-lead.json"
+    assert inbox_file.exists()
+    assert json.loads(inbox_file.read_text()) == []
+
+
+def test_ensure_inbox_no_config(teams_dir):
+    """ensure_inbox returns False when team config doesn't exist."""
+    assert ensure_inbox("nonexistent") is False
+
+
+def test_ensure_inbox_idempotent(teams_dir):
+    """ensure_inbox doesn't overwrite existing inbox file."""
+    _create_team(teams_dir, "my-session")
+    inbox_file = teams_dir / "my-session" / "inboxes" / "team-lead.json"
+
+    # Write a message first
+    write_to_inbox("my-session", "alice", "existing message")
+    assert len(json.loads(inbox_file.read_text())) == 1
+
+    # ensure_inbox should NOT clobber existing file
+    ensure_inbox("my-session")
+    assert len(json.loads(inbox_file.read_text())) == 1
