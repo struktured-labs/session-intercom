@@ -22,31 +22,23 @@ async def test_register_and_list():
 
 
 @pytest.mark.asyncio
-async def test_register_duplicate_active_fails():
+async def test_register_duplicate_reclaims():
     await db.init_db()
-    await db.register_session("alice")
-    with pytest.raises(ValueError, match="already registered"):
-        await db.register_session("alice")
+    s1 = await db.register_session("alice")
+    s2 = await db.register_session("alice")
+    assert s1.id == s2.id
 
 
 @pytest.mark.asyncio
-async def test_register_replaces_stale(monkeypatch):
+async def test_register_idempotent(monkeypatch):
     await db.init_db()
-    # Register then make stale by setting heartbeat far in the past
     s1 = await db.register_session("alice")
-    conn = await db.get_connection()
-    try:
-        await conn.execute(
-            "UPDATE sessions SET last_heartbeat = datetime('now', '-20 minutes') WHERE id = ?",
-            (s1.id,),
-        )
-        await conn.commit()
-    finally:
-        await conn.close()
-
+    # Re-registering the same name reclaims the session (idempotent)
     s2 = await db.register_session("alice")
-    assert s2.id != s1.id
+    assert s2.id == s1.id
     assert s2.name == "alice"
+    # Heartbeat should be refreshed
+    assert s2.last_heartbeat >= s1.last_heartbeat
 
 
 @pytest.mark.asyncio
@@ -188,7 +180,7 @@ async def test_cleanup():
     conn = await db.get_connection()
     try:
         await conn.execute(
-            "UPDATE sessions SET last_heartbeat = datetime('now', '-60 minutes') WHERE id = ?",
+            "UPDATE sessions SET last_heartbeat = datetime('now', '-21 days') WHERE id = ?",
             (s.id,),
         )
         await conn.commit()
@@ -253,7 +245,7 @@ async def test_cleanup_with_thread_replies():
     conn = await db.get_connection()
     try:
         await conn.execute(
-            "UPDATE sessions SET last_heartbeat = datetime('now', '-60 minutes') WHERE id = ?",
+            "UPDATE sessions SET last_heartbeat = datetime('now', '-21 days') WHERE id = ?",
             (alice.id,),
         )
         await conn.commit()
@@ -266,8 +258,8 @@ async def test_cleanup_with_thread_replies():
 
 
 @pytest.mark.asyncio
-async def test_register_replaces_stale_with_threads():
-    """Regression: re-registering a stale session must handle thread FK refs."""
+async def test_register_idempotent_preserves_messages():
+    """Re-registering keeps the same session ID, so messages and threads are preserved."""
     await db.init_db()
     alice = await db.register_session("alice")
     await db.register_session("bob")
@@ -275,18 +267,11 @@ async def test_register_replaces_stale_with_threads():
     msg = await db.send_message("alice", "bob", "original")
     await db.send_message("bob", "alice", "threaded reply", thread_id=msg.id)
 
-    # Make Alice stale
-    conn = await db.get_connection()
-    try:
-        await conn.execute(
-            "UPDATE sessions SET last_heartbeat = datetime('now', '-60 minutes') WHERE id = ?",
-            (alice.id,),
-        )
-        await conn.commit()
-    finally:
-        await conn.close()
-
-    # Re-registering should NOT raise FK constraint error
+    # Re-register alice — should reclaim, not replace
     new_alice = await db.register_session("alice")
     assert new_alice.name == "alice"
-    assert new_alice.id != alice.id
+    assert new_alice.id == alice.id
+
+    # Messages should still be intact
+    history = await db.get_history("alice", with_session="bob")
+    assert len(history) == 2

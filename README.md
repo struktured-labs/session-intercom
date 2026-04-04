@@ -112,7 +112,7 @@ Session A                          Session B
 | `intercom_broadcast` | Broadcast to a channel (all sessions) |
 | `intercom_poll` | Manual poll (only needed without native inbox) |
 | `intercom_list_sessions` | Discover registered sessions |
-| `intercom_heartbeat` | Keep-alive ping (poll does this automatically) |
+| `intercom_heartbeat` | Keep-alive ping (send/poll do this automatically) |
 | `intercom_history` | Retrieve message history with pagination |
 | `intercom_list_channels` | List available channels |
 | `intercom_create_channel` | Create a new broadcast channel |
@@ -126,8 +126,9 @@ Session A                          Session B
 - **Threading** — reply to specific messages with `thread_id`
 - **Message history** — paginated history with `before_id` cursor
 - **Read cursors** — efficient tracking of unread messages per session
+- **Idempotent registration** — re-register anytime without errors; crashed sessions just reconnect
 - **Session discovery** — list active sessions with heartbeat status
-- **Stale cleanup** — automatic removal of inactive sessions (configurable TTL)
+- **Explicit cleanup only** — sessions persist for weeks; cleanup runs only when you ask for it
 - **Concurrent-safe** — SQLite WAL mode + flock on inbox files
 
 ## Architecture

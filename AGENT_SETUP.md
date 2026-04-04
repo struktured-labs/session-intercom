@@ -62,5 +62,7 @@ intercom_broadcast("tester", "all tests passing on main", "general")
 - Names must be alphanumeric with hyphens/underscores, 1-64 chars
 - TeamCreate name and intercom_register name should match
 - Messages are capped at 32KB
-- Sessions go stale after 10 minutes without heartbeat (sending/polling refreshes it)
+- Registration is idempotent — safe to call again after a crash or restart
+- Heartbeat refreshes on send, broadcast, and poll — active sessions stay alive automatically
+- Sessions persist for weeks; cleanup only runs on explicit `intercom_cleanup()` calls
 - `intercom_poll` is still available but unnecessary with native inbox delivery

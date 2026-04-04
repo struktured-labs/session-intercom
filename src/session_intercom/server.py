@@ -136,7 +136,7 @@ async def intercom_list_sessions(include_stale: bool = False) -> str:
     """List all registered sessions.
 
     Args:
-        include_stale: Include sessions with no heartbeat in 10+ minutes (default: false).
+        include_stale: Include sessions with no recent heartbeat (default: false).
     """
     sessions = await db.list_sessions(include_stale)
     return _json({

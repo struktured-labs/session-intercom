@@ -15,8 +15,8 @@ DB_PATH = DB_DIR / "intercom.db"
 
 MAX_BODY_SIZE = 32768
 NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
-STALE_MINUTES = 10
-CLEANUP_MINUTES = 30
+STALE_MINUTES = 20160      # 2 weeks
+CLEANUP_MINUTES = 20160    # 2 weeks
 
 SCHEMA = """\
 CREATE TABLE IF NOT EXISTS sessions (
@@ -122,37 +122,27 @@ async def register_session(
         validate_name(team_name)
     db = await get_connection()
     try:
-        # Check if name already taken
         row = await db.execute_fetchall(
-            "SELECT id, last_heartbeat FROM sessions WHERE name = ?", (name,)
+            "SELECT * FROM sessions WHERE name = ?", (name,)
         )
+        now = _now()
         if row:
-            hb = row[0]["last_heartbeat"]
-            # Check if stale
-            cursor = await db.execute(
-                "SELECT strftime('%s', 'now') - strftime('%s', ?) AS age_seconds", (hb,)
-            )
-            age_row = await cursor.fetchone()
-            age_seconds = age_row["age_seconds"] if age_row else 0
-            if age_seconds < STALE_MINUTES * 60:
-                raise ValueError(
-                    f"Session name '{name}' is already registered and active "
-                    f"(last heartbeat {age_seconds}s ago). Choose a different name."
-                )
-            # Replace stale session — clear FK references first
-            old_id = row[0]["id"]
-            await db.execute("DELETE FROM read_cursors WHERE session_id = ?", (old_id,))
-            await db.execute("UPDATE messages SET recipient_id = NULL WHERE recipient_id = ?", (old_id,))
-            # Detach thread replies pointing at messages we're about to delete
+            # Idempotent: reclaim existing session, refresh heartbeat & metadata
+            existing = row[0]
             await db.execute(
-                "UPDATE messages SET thread_id = NULL WHERE thread_id IN "
-                "(SELECT id FROM messages WHERE sender_id = ?)", (old_id,)
+                "UPDATE sessions SET last_heartbeat = ?, metadata = COALESCE(?, metadata), "
+                "team_name = COALESCE(?, team_name) WHERE id = ?",
+                (now, metadata, team_name, existing["id"]),
             )
-            await db.execute("DELETE FROM messages WHERE sender_id = ?", (old_id,))
-            await db.execute("DELETE FROM sessions WHERE id = ?", (old_id,))
+            await db.commit()
+            return Session(
+                id=existing["id"], name=name, created_at=existing["created_at"],
+                last_heartbeat=now,
+                metadata=metadata if metadata is not None else existing["metadata"],
+                team_name=team_name if team_name is not None else existing["team_name"],
+            )
 
         session_id = str(uuid.uuid4())
-        now = _now()
         await db.execute(
             "INSERT INTO sessions (id, name, created_at, last_heartbeat, metadata, team_name)"
             " VALUES (?, ?, ?, ?, ?, ?)",
@@ -189,8 +179,6 @@ async def heartbeat(name: str) -> Session:
 async def list_sessions(include_stale: bool = False) -> list[Session]:
     db = await get_connection()
     try:
-        # Opportunistic cleanup
-        await _cleanup_stale(db, CLEANUP_MINUTES)
         if include_stale:
             rows = await db.execute_fetchall("SELECT * FROM sessions ORDER BY name")
         else:
@@ -226,6 +214,11 @@ async def send_message(
     try:
         sender = await get_session_by_name(db, from_name)
         recipient = await get_session_by_name(db, to_name)
+
+        # Update sender heartbeat
+        await db.execute(
+            "UPDATE sessions SET last_heartbeat = ? WHERE id = ?", (_now(), sender["id"])
+        )
 
         if thread_id is not None:
             rows = await db.execute_fetchall("SELECT id FROM messages WHERE id = ?", (thread_id,))
@@ -265,6 +258,11 @@ async def broadcast_message(
     db = await get_connection()
     try:
         sender = await get_session_by_name(db, from_name)
+
+        # Update sender heartbeat
+        await db.execute(
+            "UPDATE sessions SET last_heartbeat = ? WHERE id = ?", (_now(), sender["id"])
+        )
 
         # Verify channel exists
         rows = await db.execute_fetchall("SELECT name FROM channels WHERE name = ?", (channel,))
@@ -318,9 +316,6 @@ async def poll_messages(
         await db.execute(
             "UPDATE sessions SET last_heartbeat = ? WHERE id = ?", (_now(), session_id)
         )
-
-        # Opportunistic cleanup
-        await _cleanup_stale(db, CLEANUP_MINUTES)
 
         messages: list[Message] = []
 
