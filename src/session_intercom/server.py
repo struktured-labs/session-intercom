@@ -57,10 +57,17 @@ async def intercom_register(
             from .inbox import ensure_inbox
             result["native_inbox"] = ensure_inbox(team_name)
             if not result["native_inbox"]:
-                result["warning"] = (
-                    f"Team '{team_name}' config not found. "
-                    "Make sure you called TeamCreate first."
+                result["next_step"] = (
+                    f"Call TeamCreate(team_name='{team_name}') now to enable native "
+                    f"zero-polling inbox delivery, then re-call intercom_register with "
+                    f"the same name. Registration is idempotent — safe to call again."
                 )
+        else:
+            result["tip"] = (
+                "For zero-polling delivery: call TeamCreate(team_name=<name>), then "
+                "re-call intercom_register(name=<name>, team_name=<name>). Or use the "
+                "/session-intercom:intercom slash command if you have the plugin installed."
+            )
         return _json(result)
     except ValueError as e:
         return _json({"error": str(e)})
