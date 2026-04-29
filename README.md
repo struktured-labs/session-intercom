@@ -116,6 +116,7 @@ Session A                          Session B
 | `intercom_history` | Retrieve message history with pagination |
 | `intercom_list_channels` | List available channels |
 | `intercom_create_channel` | Create a new broadcast channel |
+| `intercom_diagnose` | Check whether native inbox delivery is actually working |
 | `intercom_cleanup` | Remove stale sessions |
 
 ## Features
@@ -150,6 +151,26 @@ src/session_intercom/
 ```bash
 uv run --extra dev pytest tests/ -v
 ```
+
+## Native delivery troubleshooting
+
+The CLI's `InboxPoller` binds to a team's `leadSessionId` at conversation startup. If your conversation started **before** `TeamCreate` ran (or before this team config existed for your session), native delivery may silently not fire — `intercom_register` will still report `inbox_file_ready: true` because the file is set up, but messages won't make it into your conversation between turns.
+
+Symptoms: messages from other sessions don't appear automatically; you only see them by calling `intercom_history` or `intercom_poll`.
+
+Diagnose:
+
+```
+intercom_diagnose("your-session-name")
+```
+
+Verdict will be one of:
+- `ok` — file inbox is empty/read, delivery is plausibly working (have someone DM you to confirm)
+- `delivery_likely_broken` — file inbox has unread messages that never made it in-band; the in-process poller binding is stale
+- `no_team_config` — `TeamCreate` was never called for this name
+- `no_team` — session was registered without a `team_name`
+
+If broken, the only durable fix is to restart the session (which loses context). Until then, fall back to `intercom_poll` for explicit drains.
 
 ## Without native inbox (legacy mode)
 

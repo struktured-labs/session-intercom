@@ -55,12 +55,21 @@ async def intercom_register(
         result = {"status": "registered", "session": asdict(session)}
         if team_name:
             from .inbox import ensure_inbox
-            result["native_inbox"] = ensure_inbox(team_name)
-            if not result["native_inbox"]:
+            result["inbox_file_ready"] = ensure_inbox(team_name)
+            if not result["inbox_file_ready"]:
                 result["next_step"] = (
                     f"Call TeamCreate(team_name='{team_name}') now to enable native "
                     f"zero-polling inbox delivery, then re-call intercom_register with "
                     f"the same name. Registration is idempotent — safe to call again."
+                )
+            else:
+                result["delivery_caveat"] = (
+                    "Inbox file is ready, but the CLI's InboxPoller binds to "
+                    "leadSessionId at conversation startup. If your conversation "
+                    "started before TeamCreate ran (or before this team was registered "
+                    "with this session), native delivery may NOT actually fire. Run "
+                    "intercom_diagnose to verify, especially for long-lived sessions "
+                    "across compactions."
                 )
         else:
             result["tip"] = (
@@ -218,6 +227,87 @@ async def intercom_create_channel(name: str, description: str | None = None) -> 
         return _json({"status": "created", "channel": asdict(channel)})
     except (ValueError, Exception) as e:
         return _json({"error": str(e)})
+
+
+@mcp.tool()
+async def intercom_diagnose(name: str) -> str:
+    """Diagnose native-inbox delivery health for this session.
+
+    Checks the team config, file inbox state, MCP-side cursors, and infers
+    whether the CLI's InboxPoller is actually delivering messages between turns.
+
+    Use this when:
+    - Messages from other sessions don't seem to be arriving automatically
+    - You suspect the leadSessionId binding is stale (long-lived conversation)
+    - Before assuming intercom_register's inbox_file_ready=true means delivery works
+
+    Returns a structured diagnosis with verdict + suggested next steps.
+
+    Args:
+        name: Your registered session name.
+    """
+    try:
+        diag = await db.diagnose_session(name)
+    except ValueError as e:
+        return _json({"error": str(e)})
+
+    session = diag["session"]
+    team_name = session.get("team_name")
+    result: dict = {
+        "session_name": session["name"],
+        "team_name": team_name,
+        "last_heartbeat": session["last_heartbeat"],
+        "mcp_unread_dms": diag["mcp_unread_dms"],
+        "mcp_unread_channel_msgs": diag["mcp_unread_channel_msgs"],
+        "latest_addressed_message": diag["latest_addressed_message"],
+    }
+
+    if not team_name:
+        result["verdict"] = "no_team"
+        result["explanation"] = (
+            "This session has no team_name set. Native inbox delivery is disabled. "
+            "Either re-register with a team_name (after calling TeamCreate), or rely "
+            "on manual intercom_poll."
+        )
+        return _json(result)
+
+    from .inbox import inbox_stats
+    stats = inbox_stats(team_name)
+    result["inbox_stats"] = stats
+
+    if stats is None:
+        result["verdict"] = "no_team_config"
+        result["explanation"] = (
+            f"~/.claude/teams/{team_name}/config.json does not exist. "
+            f"Call TeamCreate(team_name='{team_name}') to create it."
+        )
+    elif stats["unread_messages"] > 0:
+        result["verdict"] = "delivery_likely_broken"
+        result["explanation"] = (
+            f"File inbox has {stats['unread_messages']} unread message(s) but they "
+            f"haven't been delivered to your conversation. The CLI's InboxPoller "
+            f"likely isn't bound to this session — common cause: leadSessionId in "
+            f"team config didn't match this conversation's session ID at startup. "
+            f"Workarounds: (a) call intercom_poll('{session['name']}') to drain "
+            f"messages via MCP cursor, (b) restart this session for a clean "
+            f"binding (loses context), or (c) keep using manual polling. The MCP "
+            f"cannot fix the in-process binding."
+        )
+    elif diag["latest_addressed_message"] is None:
+        result["verdict"] = "no_messages_yet"
+        result["explanation"] = (
+            "No messages have been addressed to this session yet. Have someone "
+            "send a test DM with intercom_send to verify delivery."
+        )
+    else:
+        result["verdict"] = "ok"
+        result["explanation"] = (
+            "File inbox is empty (or fully read) and config exists. Native "
+            "delivery is plausibly working. Have a sender try a fresh DM and "
+            "re-run intercom_diagnose if you want to confirm — if a new DM "
+            "arrives in the file inbox and stays unread, delivery is broken."
+        )
+    return _json(result)
 
 
 @mcp.tool()

@@ -66,3 +66,4 @@ intercom_broadcast("tester", "all tests passing on main", "general")
 - Heartbeat refreshes on send, broadcast, and poll — active sessions stay alive automatically
 - Sessions persist for weeks; cleanup only runs on explicit `intercom_cleanup()` calls
 - `intercom_poll` is still available but unnecessary with native inbox delivery
+- If native delivery feels broken (no auto-arrival despite registration), run `intercom_diagnose("<your-name>")` to check. Long-lived sessions whose team config was created late can have a stale poller binding that only a session restart fixes.

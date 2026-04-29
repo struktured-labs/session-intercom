@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from session_intercom import db
-from session_intercom.inbox import ensure_inbox, inbox_exists, write_to_inbox
+from session_intercom.inbox import ensure_inbox, inbox_exists, inbox_stats, write_to_inbox
 
 
 @pytest.fixture
@@ -217,3 +217,51 @@ def test_ensure_inbox_idempotent(teams_dir):
     # ensure_inbox should NOT clobber existing file
     ensure_inbox("my-session")
     assert len(json.loads(inbox_file.read_text())) == 1
+
+
+def test_inbox_stats_no_team(teams_dir):
+    assert inbox_stats("nonexistent") is None
+
+
+def test_inbox_stats_empty_inbox(teams_dir):
+    _create_team(teams_dir, "alice")
+    config = teams_dir / "alice" / "config.json"
+    config.write_text(json.dumps({"name": "alice", "leadSessionId": "session-xyz"}))
+    ensure_inbox("alice")
+    stats = inbox_stats("alice")
+    assert stats["config_exists"] is True
+    assert stats["lead_session_id"] == "session-xyz"
+    assert stats["total_messages"] == 0
+    assert stats["unread_messages"] == 0
+
+
+def test_inbox_stats_unread_count(teams_dir):
+    _create_team(teams_dir, "bob")
+    config = teams_dir / "bob" / "config.json"
+    config.write_text(json.dumps({"name": "bob", "leadSessionId": "session-abc"}))
+    write_to_inbox("bob", "alice", "msg1")
+    write_to_inbox("bob", "alice", "msg2")
+    write_to_inbox("bob", "carol", "msg3")
+
+    stats = inbox_stats("bob")
+    assert stats["total_messages"] == 3
+    assert stats["unread_messages"] == 3
+    assert "alice" in stats["latest_unread_from"]
+    assert "carol" in stats["latest_unread_from"]
+    assert stats["latest_message_timestamp"] is not None
+
+
+def test_inbox_stats_marks_read_correctly(teams_dir):
+    _create_team(teams_dir, "bob")
+    config = teams_dir / "bob" / "config.json"
+    config.write_text(json.dumps({"name": "bob"}))
+    write_to_inbox("bob", "alice", "msg")
+
+    inbox_file = teams_dir / "bob" / "inboxes" / "team-lead.json"
+    msgs = json.loads(inbox_file.read_text())
+    msgs[0]["read"] = True
+    inbox_file.write_text(json.dumps(msgs))
+
+    stats = inbox_stats("bob")
+    assert stats["total_messages"] == 1
+    assert stats["unread_messages"] == 0
