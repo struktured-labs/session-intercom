@@ -170,7 +170,13 @@ Verdict will be one of:
 - `no_team_config` — `TeamCreate` was never called for this name
 - `no_team` — session was registered without a `team_name`
 
-If broken, the only durable fix is to restart the session (which loses context). Until then, fall back to `intercom_poll` for explicit drains.
+If broken, recover with:
+
+1. In the broken session, call `TeamDelete()` (operates on the current team, no args). Wipes `~/.claude/teams/<name>/` and clears stale team context.
+2. Restart the Claude session.
+3. In the fresh session, run `/session-intercom:intercom <same-name>` (or manually: `TeamCreate(team_name=<name>)` then `intercom_register(name=<name>, team_name=<name>)`).
+
+A plain restart without `TeamDelete` first does NOT fix it — the new conversation's internal session ID won't match the existing config's `leadSessionId`, and `TeamCreate` errors when the team already exists. `intercom_register` is idempotent so no message history is lost. Until you can restart, fall back to `intercom_poll` for explicit drains.
 
 ## Without native inbox (legacy mode)
 
