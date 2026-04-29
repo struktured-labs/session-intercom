@@ -170,13 +170,16 @@ Verdict will be one of:
 - `no_team_config` — `TeamCreate` was never called for this name
 - `no_team` — session was registered without a `team_name`
 
-If broken, recover with:
+If broken, recover **without restarting Claude**:
 
-1. In the broken session, call `TeamDelete()` (operates on the current team, no args). Wipes `~/.claude/teams/<name>/` and clears stale team context.
-2. Restart the Claude session.
-3. In the fresh session, run `/session-intercom:intercom <same-name>` (or manually: `TeamCreate(team_name=<name>)` then `intercom_register(name=<name>, team_name=<name>)`).
+1. `TeamDelete()` in the broken session (no args; operates on the current team). Clears the in-process binding and wipes `~/.claude/teams/<name>/`.
+2. `TeamCreate(team_name=<name>)` — fresh config with current session ID as lead.
+3. `intercom_register(name=<name>, team_name=<name>)` — idempotent reclaim, no DM history lost.
+4. (optional) `/mcp` to reconnect MCP servers if the MCP code itself was updated.
 
-A plain restart without `TeamDelete` first does NOT fix it — the new conversation's internal session ID won't match the existing config's `leadSessionId`, and `TeamCreate` errors when the team already exists. `intercom_register` is idempotent so no message history is lost. Until you can restart, fall back to `intercom_poll` for explicit drains.
+`TeamDelete` is what makes this work without a Claude restart — it clears the in-process team context binding, so the next `TeamCreate` rebinds the InboxPoller correctly. A plain re-run of `TeamCreate` errors with "Already leading team..." — it won't update the binding by itself.
+
+Until you can run the recipe, fall back to `intercom_poll` for explicit drains.
 
 ## Without native inbox (legacy mode)
 
