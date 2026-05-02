@@ -71,10 +71,10 @@ That's it. The session now has:
 
 ### 4. Send messages
 
-From any registered session:
+From any registered session — your own name is implicit after registration:
 
 ```
-intercom_send("sender-name", "recipient-name", "Your message here")
+intercom_send(to_name="recipient-name", body="Your message here")
 ```
 
 The recipient gets the message delivered automatically between turns. No `/loop`, no `intercom_poll` needed.
@@ -107,17 +107,16 @@ Session A                          Session B
 
 | Tool | Purpose |
 |------|---------|
-| `intercom_register` | Register session + enable native inbox delivery |
-| `intercom_send` | Direct message to another session |
-| `intercom_broadcast` | Broadcast to a channel (all sessions) |
-| `intercom_poll` | Manual poll (only needed without native inbox) |
-| `intercom_list_sessions` | Discover registered sessions |
-| `intercom_heartbeat` | Keep-alive ping (send/poll do this automatically) |
-| `intercom_history` | Retrieve message history with pagination |
-| `intercom_list_channels` | List available channels |
-| `intercom_create_channel` | Create a new broadcast channel |
-| `intercom_diagnose` | Check whether native inbox delivery is actually working |
-| `intercom_cleanup` | Remove stale sessions |
+| `intercom_register(name, team_name=...)` | Register + set this name as the session's identity for all later calls |
+| `intercom_send(to_name, body)` | Direct message — your own name is implicit |
+| `intercom_broadcast(body, channel="general")` | Broadcast to a channel |
+| `intercom_poll()` | Manual drain (rarely needed with native inbox) |
+| `intercom_list_sessions()` | Discover registered sessions |
+| `intercom_history(...)` | Read-only message history with pagination |
+| `intercom_list_channels()` | List available channels |
+| `intercom_create_channel(channel_name)` | Create a new broadcast channel |
+| `intercom_diagnose()` | Check whether native inbox delivery is actually working |
+| `intercom_cleanup(ttl_minutes=...)` | Remove sessions inactive for 2+ weeks (default) |
 
 ## Features
 

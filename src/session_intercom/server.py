@@ -11,6 +11,11 @@ from . import db
 
 logger = logging.getLogger("session-intercom")
 
+# Per-process state: each Claude session has its own MCP subprocess, so a
+# module-level "current session" is exactly the right scope. After register,
+# all other tools default to this name unless an explicit from_name overrides.
+_current_session: str | None = None
+
 
 @asynccontextmanager
 async def lifespan(server: FastMCP):
@@ -28,54 +33,66 @@ def _json(obj) -> str:
     return json.dumps(obj, indent=2, default=str)
 
 
+def _resolve_name(provided: str | None) -> str:
+    """Return the explicit name if given, otherwise the registered session name."""
+    if provided:
+        return provided
+    if _current_session:
+        return _current_session
+    raise ValueError(
+        "No session name available. Call intercom_register(name=...) first, "
+        "or pass an explicit name argument."
+    )
+
+
 # --- Tools ---
 
 
 @mcp.tool()
 async def intercom_register(
-    name: str, metadata: str | None = None, team_name: str | None = None
+    name: str, team_name: str | None = None, metadata: str | None = None
 ) -> str:
     """Register this session with the intercom system.
 
-    For zero-polling message delivery, first create a personal team with TeamCreate
-    using your session name, then pass that name as team_name here. Messages will be
-    written directly to your native Claude Code inbox — no /loop needed.
+    After registering, all other intercom tools default to this name — you
+    don't need to pass it on every call. Pass team_name (typically the same
+    as name) to enable zero-polling native inbox delivery.
 
     Setup (one-time per session):
-      1. Call TeamCreate with team_name=<your-name>
-      2. Call intercom_register(name=<your-name>, team_name=<your-name>)
+      1. Call TeamCreate(team_name=<name>)
+      2. Call intercom_register(name=<name>, team_name=<name>)
 
     Args:
-        name: Human-readable session name (alphanumeric/hyphens, 1-64 chars). E.g. "rom-hacker", "fleet-ops".
-        metadata: Optional JSON string with arbitrary session info.
-        team_name: Optional Claude Code team name for native inbox delivery. Must match a team you created with TeamCreate.
+        name: Your session name (alphanumeric/hyphens, 1-64 chars). E.g. "rom-hacker".
+        team_name: Claude Code team name for native delivery. Usually same as name.
+        metadata: Optional free-form string with session info.
     """
+    global _current_session
     try:
         session = await db.register_session(name, metadata, team_name)
-        result = {"status": "registered", "session": asdict(session)}
+        _current_session = name
+        result: dict = {"status": "registered", "session": asdict(session)}
         if team_name:
             from .inbox import ensure_inbox
             result["inbox_file_ready"] = ensure_inbox(team_name)
             if not result["inbox_file_ready"]:
                 result["next_step"] = (
-                    f"Call TeamCreate(team_name='{team_name}') now to enable native "
-                    f"zero-polling inbox delivery, then re-call intercom_register with "
-                    f"the same name. Registration is idempotent — safe to call again."
+                    f"Call TeamCreate(team_name='{team_name}') now to enable "
+                    f"native zero-polling delivery, then re-call intercom_register. "
+                    f"Registration is idempotent."
                 )
             else:
                 result["delivery_caveat"] = (
-                    "Inbox file is ready, but the CLI's InboxPoller binds to "
+                    "Inbox file is set up, but the CLI's InboxPoller binds to "
                     "leadSessionId at conversation startup. If your conversation "
-                    "started before TeamCreate ran (or before this team was registered "
-                    "with this session), native delivery may NOT actually fire. Run "
-                    "intercom_diagnose to verify, especially for long-lived sessions "
-                    "across compactions."
+                    "started before TeamCreate ran, native delivery may silently "
+                    "fail. Run intercom_diagnose() to verify."
                 )
         else:
             result["tip"] = (
-                "For zero-polling delivery: call TeamCreate(team_name=<name>), then "
-                "re-call intercom_register(name=<name>, team_name=<name>). Or use the "
-                "/session-intercom:intercom slash command if you have the plugin installed."
+                "For zero-polling delivery: call TeamCreate(team_name=<name>), "
+                "then re-register with team_name set. Or use the "
+                "/session-intercom:intercom slash command."
             )
         return _json(result)
     except ValueError as e:
@@ -83,39 +100,63 @@ async def intercom_register(
 
 
 @mcp.tool()
-async def intercom_send(from_name: str, to_name: str, body: str, thread_id: int | None = None) -> str:
+async def intercom_send(
+    to_name: str,
+    body: str,
+    thread_id: int | None = None,
+    from_name: str | None = None,
+) -> str:
     """Send a direct message to another session.
 
+    Defaults `from_name` to the currently registered session — you don't
+    need to pass it unless you want to send as a different identity.
+
     Args:
-        from_name: Your registered session name.
         to_name: Recipient session name.
         body: Message content (max 32KB).
         thread_id: Optional message ID to reply to (creates a thread).
+        from_name: Sender override. Defaults to the registered session.
     """
     try:
-        msg = await db.send_message(from_name, to_name, body, thread_id)
-        return _json({"status": "sent", "message_id": msg.id, "to": to_name, "created_at": msg.created_at})
+        sender = _resolve_name(from_name)
+        msg = await db.send_message(sender, to_name, body, thread_id)
+        return _json({
+            "status": "sent",
+            "message_id": msg.id,
+            "from": sender,
+            "to": to_name,
+            "created_at": msg.created_at,
+        })
     except ValueError as e:
         return _json({"error": str(e)})
 
 
 @mcp.tool()
 async def intercom_broadcast(
-    from_name: str, body: str, channel: str = "general", thread_id: int | None = None
+    body: str,
+    channel: str = "general",
+    thread_id: int | None = None,
+    from_name: str | None = None,
 ) -> str:
-    """Broadcast a message to a channel (all sessions can see it).
+    """Broadcast a message to a channel (all sessions on the channel see it).
+
+    Defaults `from_name` to the currently registered session.
 
     Args:
-        from_name: Your registered session name.
         body: Message content (max 32KB).
         channel: Channel name (default: "general").
         thread_id: Optional message ID to reply to (creates a thread).
+        from_name: Sender override. Defaults to the registered session.
     """
     try:
-        msg = await db.broadcast_message(from_name, body, channel, thread_id)
+        sender = _resolve_name(from_name)
+        msg = await db.broadcast_message(sender, body, channel, thread_id)
         return _json({
-            "status": "broadcast", "message_id": msg.id,
-            "channel": channel, "created_at": msg.created_at,
+            "status": "broadcast",
+            "message_id": msg.id,
+            "from": sender,
+            "channel": channel,
+            "created_at": msg.created_at,
         })
     except ValueError as e:
         return _json({"error": str(e)})
@@ -123,21 +164,26 @@ async def intercom_broadcast(
 
 @mcp.tool()
 async def intercom_poll(
-    name: str, mark_read: bool = True, limit: int = 50, channel: str | None = None
+    name: str | None = None,
+    mark_read: bool = True,
+    limit: int = 50,
+    channel: str | None = None,
 ) -> str:
-    """Poll for new/unread messages. Also updates your heartbeat.
+    """Poll for new/unread messages. Updates your heartbeat.
 
-    If you registered with a team_name, messages are delivered to your native inbox
-    automatically — you only need this for checking history or if not using native delivery.
+    With native inbox delivery active, you don't need to call this — messages
+    arrive automatically between turns. Use it for explicit drains or as a
+    workaround when intercom_diagnose reports broken delivery.
 
     Args:
-        name: Your registered session name.
+        name: Session name override. Defaults to the registered session.
         mark_read: Advance read cursors so these messages won't appear again (default: true).
-        limit: Max messages to return (1-200, default: 50).
+        limit: Max messages (1-200, default: 50).
         channel: Filter to a specific channel. Omit to get DMs + all channels.
     """
     try:
-        messages, remaining = await db.poll_messages(name, mark_read, limit, channel)
+        session_name = _resolve_name(name)
+        messages, remaining = await db.poll_messages(session_name, mark_read, limit, channel)
         return _json({
             "messages": [asdict(m) for m in messages],
             "count": len(messages),
@@ -162,40 +208,30 @@ async def intercom_list_sessions(include_stale: bool = False) -> str:
 
 
 @mcp.tool()
-async def intercom_heartbeat(name: str) -> str:
-    """Update your session heartbeat (intercom_poll does this automatically).
-
-    Args:
-        name: Your registered session name.
-    """
-    try:
-        session = await db.heartbeat(name)
-        return _json({"status": "ok", "name": session.name, "last_heartbeat": session.last_heartbeat})
-    except ValueError as e:
-        return _json({"error": str(e)})
-
-
-@mcp.tool()
 async def intercom_history(
-    name: str,
     with_session: str | None = None,
     channel: str | None = None,
     thread_id: int | None = None,
     limit: int = 50,
     before_id: int | None = None,
+    name: str | None = None,
 ) -> str:
-    """Retrieve message history (including already-read messages).
+    """Retrieve message history (read-only — does not advance cursors).
+
+    Useful for inspecting messages without consuming them. Defaults to your
+    registered session.
 
     Args:
-        name: Your registered session name.
         with_session: Filter to DM conversation with this session.
         channel: Filter to messages in this channel.
         thread_id: Get all messages in a specific thread.
         limit: Max messages (1-200, default: 50).
         before_id: Pagination cursor — get messages before this ID.
+        name: Session name override. Defaults to the registered session.
     """
     try:
-        messages = await db.get_history(name, with_session, channel, thread_id, limit, before_id)
+        session_name = _resolve_name(name)
+        messages = await db.get_history(session_name, with_session, channel, thread_id, limit, before_id)
         return _json({
             "messages": [asdict(m) for m in messages],
             "count": len(messages),
@@ -215,39 +251,33 @@ async def intercom_list_channels() -> str:
 
 
 @mcp.tool()
-async def intercom_create_channel(name: str, description: str | None = None) -> str:
+async def intercom_create_channel(channel_name: str, description: str | None = None) -> str:
     """Create a new channel for broadcast messages.
 
     Args:
-        name: Channel name (alphanumeric/hyphens, 1-64 chars).
+        channel_name: Channel name (alphanumeric/hyphens, 1-64 chars).
         description: Optional channel description.
     """
     try:
-        channel = await db.create_channel(name, description)
+        channel = await db.create_channel(channel_name, description)
         return _json({"status": "created", "channel": asdict(channel)})
     except (ValueError, Exception) as e:
         return _json({"error": str(e)})
 
 
 @mcp.tool()
-async def intercom_diagnose(name: str) -> str:
-    """Diagnose native-inbox delivery health for this session.
+async def intercom_diagnose(name: str | None = None) -> str:
+    """Diagnose native-inbox delivery health.
 
-    Checks the team config, file inbox state, MCP-side cursors, and infers
-    whether the CLI's InboxPoller is actually delivering messages between turns.
-
-    Use this when:
-    - Messages from other sessions don't seem to be arriving automatically
-    - You suspect the leadSessionId binding is stale (long-lived conversation)
-    - Before assuming intercom_register's inbox_file_ready=true means delivery works
-
-    Returns a structured diagnosis with verdict + suggested next steps.
+    Checks team config, file inbox state, and MCP-side cursors to detect when
+    the CLI's InboxPoller isn't actually delivering messages.
 
     Args:
-        name: Your registered session name.
+        name: Session name override. Defaults to the registered session.
     """
     try:
-        diag = await db.diagnose_session(name)
+        session_name = _resolve_name(name)
+        diag = await db.diagnose_session(session_name)
     except ValueError as e:
         return _json({"error": str(e)})
 
@@ -265,9 +295,9 @@ async def intercom_diagnose(name: str) -> str:
     if not team_name:
         result["verdict"] = "no_team"
         result["explanation"] = (
-            "This session has no team_name set. Native inbox delivery is disabled. "
-            "Either re-register with a team_name (after calling TeamCreate), or rely "
-            "on manual intercom_poll."
+            "This session has no team_name set. Native inbox delivery is "
+            "disabled. Re-register with a team_name (after TeamCreate), or "
+            "rely on manual intercom_poll."
         )
         return _json(result)
 
@@ -284,44 +314,49 @@ async def intercom_diagnose(name: str) -> str:
     elif stats["unread_messages"] > 0:
         result["verdict"] = "delivery_likely_broken"
         result["explanation"] = (
-            f"File inbox has {stats['unread_messages']} unread message(s) but they "
-            f"haven't been delivered to your conversation. The CLI's InboxPoller "
-            f"likely isn't bound to this session — common cause: leadSessionId in "
-            f"team config didn't match this conversation's session ID at startup. "
-            f"Workarounds: (a) call intercom_poll('{session['name']}') to drain "
-            f"messages via MCP cursor, (b) restart this session for a clean "
-            f"binding (loses context), or (c) keep using manual polling. The MCP "
-            f"cannot fix the in-process binding."
+            f"File inbox has {stats['unread_messages']} unread message(s) that "
+            f"haven't been delivered to your conversation. The CLI's "
+            f"InboxPoller likely isn't bound to this session — common cause: "
+            f"leadSessionId mismatch.\n\nFix without restarting Claude:\n"
+            f"  1. TeamDelete()  — clears the in-process binding\n"
+            f"  2. TeamCreate(team_name='{team_name}')\n"
+            f"  3. intercom_register(name='{session['name']}', team_name='{team_name}')\n"
+            f"\nUntil then, drain via intercom_poll() (no args needed)."
         )
     elif diag["latest_addressed_message"] is None:
         result["verdict"] = "no_messages_yet"
         result["explanation"] = (
             "No messages have been addressed to this session yet. Have someone "
-            "send a test DM with intercom_send to verify delivery."
+            "send a test DM to verify delivery."
         )
     else:
         result["verdict"] = "ok"
         result["explanation"] = (
             "File inbox is empty (or fully read) and config exists. Native "
-            "delivery is plausibly working. Have a sender try a fresh DM and "
-            "re-run intercom_diagnose if you want to confirm — if a new DM "
-            "arrives in the file inbox and stays unread, delivery is broken."
+            "delivery is plausibly working. To confirm, have a sender send a "
+            "fresh DM and re-run intercom_diagnose — if a new DM lands in the "
+            "file inbox and stays unread, delivery is broken."
         )
     return _json(result)
 
 
 @mcp.tool()
-async def intercom_cleanup(ttl_minutes: int = 30) -> str:
+async def intercom_cleanup(ttl_minutes: int = db.CLEANUP_MINUTES) -> str:
     """Remove stale sessions (no heartbeat within TTL).
 
+    Default TTL matches the durability promise (2 weeks). Pass a smaller value
+    to force an aggressive sweep, but be aware this will delete other agents'
+    sessions if they haven't checked in within that window.
+
     Args:
-        ttl_minutes: Minutes of inactivity before a session is considered stale (default: 30).
+        ttl_minutes: Minutes of inactivity before a session is considered stale.
     """
     removed = await db.cleanup_sessions(ttl_minutes)
     return _json({
         "status": "cleaned",
         "removed": removed,
         "count": len(removed),
+        "ttl_minutes": ttl_minutes,
     })
 
 

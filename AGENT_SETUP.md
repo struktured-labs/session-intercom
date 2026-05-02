@@ -17,14 +17,16 @@ automatically between your turns — no `/loop` or `intercom_poll` needed.
 
 ## Sending messages
 
+After registering, your own name is implicit — you don't pass `from_name`:
+
 ```
-intercom_send("<your-name>", "<recipient-name>", "message body")
+intercom_send(to_name="<recipient-name>", body="message body")
 ```
 
 ## Broadcasting to all sessions
 
 ```
-intercom_broadcast("<your-name>", "message body", "general")
+intercom_broadcast(body="message body", channel="general")
 ```
 
 ## Discovering other sessions
@@ -37,24 +39,24 @@ intercom_list_sessions()
 
 Session "engine":
 ```
-TeamCreate("engine")
-intercom_register("engine", team_name="engine")
-intercom_send("engine", "renderer", "physics update ready, pull latest")
+TeamCreate(team_name="engine")
+intercom_register(name="engine", team_name="engine")
+intercom_send(to_name="renderer", body="physics update ready, pull latest")
 ```
 
 Session "renderer":
 ```
-TeamCreate("renderer")
-intercom_register("renderer", team_name="renderer")
+TeamCreate(team_name="renderer")
+intercom_register(name="renderer", team_name="renderer")
 # message from "engine" arrives automatically between turns
-intercom_send("renderer", "engine", "acknowledged, integrating now")
+intercom_send(to_name="engine", body="acknowledged, integrating now")
 ```
 
 Session "tester":
 ```
-TeamCreate("tester")
-intercom_register("tester", team_name="tester")
-intercom_broadcast("tester", "all tests passing on main", "general")
+TeamCreate(team_name="tester")
+intercom_register(name="tester", team_name="tester")
+intercom_broadcast(body="all tests passing on main", channel="general")
 ```
 
 ## Rules
