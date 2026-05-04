@@ -12,6 +12,7 @@ dependencies = [
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
+    "pyright>=1.1.350",
 ]
 
 [project.scripts]
@@ -27,3 +28,15 @@ packages = ["src/session_intercom"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+
+[tool.pyright]
+include = ["src", "tests"]
+exclude = ["**/__pycache__", ".venv", "build", "dist"]
+pythonVersion = "3.11"
+typeCheckingMode = "basic"
+reportMissingImports = "error"
+reportMissingTypeStubs = false
+# aiosqlite's stubs declare execute_fetchall() as Iterable[Row] but the
+# returned objects are concrete subscriptable rows. Suppress the resulting
+# false-positive index errors rather than littering the code with casts.
+reportIndexIssue = "none"

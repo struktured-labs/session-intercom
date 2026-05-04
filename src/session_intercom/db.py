@@ -299,6 +299,7 @@ async def send_message(
             (sender["id"], recipient["id"], body, thread_id),
         )
         msg_id = cursor.lastrowid
+        assert msg_id is not None, "INSERT must produce a rowid"
         await db.commit()
 
         row = await db.execute_fetchall("SELECT created_at FROM messages WHERE id = ?", (msg_id,))
@@ -348,6 +349,7 @@ async def broadcast_message(
             (sender["id"], channel, body, thread_id),
         )
         msg_id = cursor.lastrowid
+        assert msg_id is not None, "INSERT must produce a rowid"
         await db.commit()
 
         row = await db.execute_fetchall("SELECT created_at FROM messages WHERE id = ?", (msg_id,))
@@ -567,7 +569,7 @@ async def get_history(
             """,
             params,
         )
-        return [_row_to_message(r) for r in reversed(rows)]
+        return [_row_to_message(r) for r in reversed(list(rows))]
     finally:
         await db.close()
 
