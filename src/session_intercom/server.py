@@ -73,22 +73,41 @@ async def intercom_register(
         _current_session = name
         result: dict = {"status": "registered", "session": asdict(session)}
         if team_name:
-            from .inbox import ensure_inbox
+            from .inbox import ensure_inbox, inbox_stats
             result["inbox_file_ready"] = ensure_inbox(team_name)
             if not result["inbox_file_ready"]:
+                result["delivery_health"] = "no_inbox"
                 result["next_step"] = (
                     f"Call TeamCreate(team_name='{team_name}') now to enable "
                     f"native zero-polling delivery, then re-call intercom_register. "
                     f"Registration is idempotent."
                 )
             else:
-                result["delivery_caveat"] = (
-                    "Inbox file is set up, but the CLI's InboxPoller binds to "
-                    "leadSessionId at conversation startup. If your conversation "
-                    "started before TeamCreate ran, native delivery may silently "
-                    "fail. Run intercom_diagnose() to verify."
-                )
+                stats = inbox_stats(team_name)
+                unread = stats["unread_messages"] if stats else 0
+                if unread > 0:
+                    # Stale-binding heuristic: if messages have been sitting in
+                    # the file inbox unread, the CLI's InboxPoller for THIS
+                    # conversation almost certainly isn't bound — most often
+                    # because the team config's leadSessionId was set by a
+                    # prior conversation.
+                    result["delivery_health"] = "likely_broken"
+                    result["unread_in_file_inbox"] = unread
+                    result["recovery"] = (
+                        f"File inbox has {unread} unread message(s) — native "
+                        f"delivery is likely broken (common cause: previous "
+                        f"conversation's leadSessionId still in team config).\n"
+                        f"\nRecovery (no Claude restart needed):\n"
+                        f"  1. TeamDelete()\n"
+                        f"  2. TeamCreate(team_name='{team_name}')\n"
+                        f"  3. intercom_register(name='{name}', team_name='{team_name}')\n"
+                        f"\nUntil then, drain via intercom_poll() — outbound "
+                        f"sends already work; only inbound auto-delivery is broken."
+                    )
+                else:
+                    result["delivery_health"] = "likely_ok"
         else:
+            result["delivery_health"] = "polling_only"
             result["tip"] = (
                 "For zero-polling delivery: call TeamCreate(team_name=<name>), "
                 "then re-register with team_name set. Or use the "

@@ -1,6 +1,7 @@
 """Smoke tests for the MCP server's per-process session state."""
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -13,6 +14,23 @@ def clear_state():
     server._current_session = None
     yield
     server._current_session = None
+
+
+@pytest.fixture
+def fake_teams_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Redirect ~/.claude/teams to a tmp dir for tests that touch inbox files."""
+    import session_intercom.inbox as inbox_mod
+
+    monkeypatch.setattr(inbox_mod, "CLAUDE_TEAMS_DIR", tmp_path)
+    return tmp_path
+
+
+def _create_team_dir(fake_teams_dir: Path, team_name: str) -> Path:
+    """Simulate TeamCreate: write config.json + create inboxes dir."""
+    team_dir = fake_teams_dir / team_name
+    (team_dir / "inboxes").mkdir(parents=True, exist_ok=True)
+    (team_dir / "config.json").write_text(json.dumps({"name": team_name}))
+    return team_dir
 
 
 def test_resolve_name_explicit_override():
@@ -104,3 +122,69 @@ async def test_cleanup_default_uses_constant():
     parsed = json.loads(out)
     assert parsed["ttl_minutes"] == db.CLEANUP_MINUTES
     assert parsed["ttl_minutes"] >= 20000  # ~2 weeks
+
+
+# --- Register delivery-health detection ---
+
+
+@pytest.mark.asyncio
+async def test_register_no_team_reports_polling_only():
+    """Registration without team_name signals polling-only, no false delivery promise."""
+    await db.init_db()
+    out = await server.intercom_register("alice")
+    parsed = json.loads(out)
+    assert parsed["status"] == "registered"
+    assert parsed["delivery_health"] == "polling_only"
+    assert "tip" in parsed
+
+
+@pytest.mark.asyncio
+async def test_register_with_team_no_inbox_signals_no_inbox(fake_teams_dir):
+    """When team config doesn't exist, delivery_health is 'no_inbox' with TeamCreate hint."""
+    await db.init_db()
+    out = await server.intercom_register("alice", team_name="alice")
+    parsed = json.loads(out)
+    assert parsed["status"] == "registered"
+    assert parsed["delivery_health"] == "no_inbox"
+    assert parsed["inbox_file_ready"] is False
+    assert "TeamCreate" in parsed["next_step"]
+
+
+@pytest.mark.asyncio
+async def test_register_with_clean_team_reports_likely_ok(fake_teams_dir):
+    """Fresh team with empty inbox → delivery_health is 'likely_ok'."""
+    _create_team_dir(fake_teams_dir, "alice")
+    await db.init_db()
+    out = await server.intercom_register("alice", team_name="alice")
+    parsed = json.loads(out)
+    assert parsed["status"] == "registered"
+    assert parsed["delivery_health"] == "likely_ok"
+    assert parsed["inbox_file_ready"] is True
+    # No misleading delivery_caveat — only emit recovery when actually broken.
+    assert "delivery_caveat" not in parsed
+    assert "recovery" not in parsed
+
+
+@pytest.mark.asyncio
+async def test_register_with_unread_inbox_reports_likely_broken(fake_teams_dir):
+    """Inbox with unread messages → 'likely_broken' + actionable recovery steps."""
+    _create_team_dir(fake_teams_dir, "alice")
+    # Simulate unread messages from a previous conversation that the new
+    # session's InboxPoller never picked up.
+    inbox_file = fake_teams_dir / "alice" / "inboxes" / "team-lead.json"
+    inbox_file.write_text(json.dumps([
+        {"from": "bob", "text": "hi", "timestamp": "2024-01-01T00:00:00Z", "read": False},
+        {"from": "carol", "text": "u up", "timestamp": "2024-01-01T00:01:00Z", "read": False},
+    ]))
+
+    await db.init_db()
+    out = await server.intercom_register("alice", team_name="alice")
+    parsed = json.loads(out)
+    assert parsed["status"] == "registered"
+    assert parsed["delivery_health"] == "likely_broken"
+    assert parsed["unread_in_file_inbox"] == 2
+    # Recovery steps are concrete and copy-pastable.
+    assert "TeamDelete" in parsed["recovery"]
+    assert "TeamCreate(team_name='alice')" in parsed["recovery"]
+    assert "intercom_register(name='alice', team_name='alice')" in parsed["recovery"]
+    assert "intercom_poll" in parsed["recovery"]
