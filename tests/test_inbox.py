@@ -229,6 +229,7 @@ def test_inbox_stats_empty_inbox(teams_dir):
     config.write_text(json.dumps({"name": "alice", "leadSessionId": "session-xyz"}))
     ensure_inbox("alice")
     stats = inbox_stats("alice")
+    assert stats is not None
     assert stats["config_exists"] is True
     assert stats["lead_session_id"] == "session-xyz"
     assert stats["total_messages"] == 0
@@ -244,6 +245,7 @@ def test_inbox_stats_unread_count(teams_dir):
     write_to_inbox("bob", "carol", "msg3")
 
     stats = inbox_stats("bob")
+    assert stats is not None
     assert stats["total_messages"] == 3
     assert stats["unread_messages"] == 3
     assert "alice" in stats["latest_unread_from"]
@@ -263,5 +265,6 @@ def test_inbox_stats_marks_read_correctly(teams_dir):
     inbox_file.write_text(json.dumps(msgs))
 
     stats = inbox_stats("bob")
+    assert stats is not None
     assert stats["total_messages"] == 1
     assert stats["unread_messages"] == 0
