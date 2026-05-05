@@ -23,10 +23,14 @@ def _create_team_config_only(teams_dir: Path, team_name: str) -> Path:
     team_dir = teams_dir / team_name
     team_dir.mkdir(parents=True, exist_ok=True)
     config = team_dir / "config.json"
-    config.write_text(json.dumps({
-        "name": team_name,
-        "members": [{"name": "team-lead", "agentId": f"team-lead@{team_name}"}],
-    }))
+    config.write_text(
+        json.dumps(
+            {
+                "name": team_name,
+                "members": [{"name": "team-lead", "agentId": f"team-lead@{team_name}"}],
+            }
+        )
+    )
     return team_dir
 
 

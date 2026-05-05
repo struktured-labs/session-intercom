@@ -172,10 +172,19 @@ async def test_register_with_unread_inbox_reports_likely_broken(fake_teams_dir):
     # Simulate unread messages from a previous conversation that the new
     # session's InboxPoller never picked up.
     inbox_file = fake_teams_dir / "alice" / "inboxes" / "team-lead.json"
-    inbox_file.write_text(json.dumps([
-        {"from": "bob", "text": "hi", "timestamp": "2024-01-01T00:00:00Z", "read": False},
-        {"from": "carol", "text": "u up", "timestamp": "2024-01-01T00:01:00Z", "read": False},
-    ]))
+    inbox_file.write_text(
+        json.dumps(
+            [
+                {"from": "bob", "text": "hi", "timestamp": "2024-01-01T00:00:00Z", "read": False},
+                {
+                    "from": "carol",
+                    "text": "u up",
+                    "timestamp": "2024-01-01T00:01:00Z",
+                    "read": False,
+                },
+            ]
+        )
+    )
 
     await db.init_db()
     out = await server.intercom_register("alice", team_name="alice")

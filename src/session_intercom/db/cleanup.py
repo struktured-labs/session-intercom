@@ -16,11 +16,14 @@ async def _cleanup_stale(db: aiosqlite.Connection, ttl_minutes: int) -> list[str
     for r in rows:
         await db.execute("DELETE FROM read_cursors WHERE session_id = ?", (r["id"],))
         # Clear message FK references before deleting session
-        await db.execute("UPDATE messages SET recipient_id = NULL WHERE recipient_id = ?", (r["id"],))
+        await db.execute(
+            "UPDATE messages SET recipient_id = NULL WHERE recipient_id = ?", (r["id"],)
+        )
         # Detach thread replies pointing at messages we're about to delete
         await db.execute(
             "UPDATE messages SET thread_id = NULL WHERE thread_id IN "
-            "(SELECT id FROM messages WHERE sender_id = ?)", (r["id"],)
+            "(SELECT id FROM messages WHERE sender_id = ?)",
+            (r["id"],),
         )
         await db.execute("DELETE FROM messages WHERE sender_id = ?", (r["id"],))
         await db.execute("DELETE FROM sessions WHERE id = ?", (r["id"],))
