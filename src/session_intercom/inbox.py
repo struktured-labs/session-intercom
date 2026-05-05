@@ -13,7 +13,7 @@ from __future__ import annotations
 import fcntl
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 logger = logging.getLogger("session-intercom.inbox")
@@ -42,10 +42,12 @@ def write_to_inbox(
     inbox = _inbox_path(team_name)
 
     if not inbox.parent.exists():
-        logger.warning("Inbox dir %s does not exist — session may not have created team yet", inbox.parent)
+        logger.warning(
+            "Inbox dir %s does not exist — session may not have created team yet", inbox.parent
+        )
         return False
 
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    timestamp = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
     new_message = {
         "from": from_name,

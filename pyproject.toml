@@ -13,6 +13,7 @@ dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
     "pyright>=1.1.350",
+    "ruff>=0.6.0",
 ]
 
 [project.scripts]
@@ -40,3 +41,25 @@ reportMissingTypeStubs = false
 # returned objects are concrete subscriptable rows. Suppress the resulting
 # false-positive index errors rather than littering the code with casts.
 reportIndexIssue = "none"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # bugbear
+    "UP",  # pyupgrade
+    "SIM", # simplify
+]
+ignore = [
+    "E501",  # line length — let formatter handle
+    "B008",  # function call in default arg (FastMCP / argparse pattern)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011"]  # asserts in tests are fine

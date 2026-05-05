@@ -18,9 +18,7 @@ async def register_session(
         validate_name(team_name)
     db = await get_connection()
     try:
-        row = await db.execute_fetchall(
-            "SELECT * FROM sessions WHERE name = ?", (name,)
-        )
+        row = await db.execute_fetchall("SELECT * FROM sessions WHERE name = ?", (name,))
         now = _now()
         if row:
             # Idempotent: reclaim existing session, refresh heartbeat & metadata
@@ -32,7 +30,9 @@ async def register_session(
             )
             await db.commit()
             return Session(
-                id=existing["id"], name=name, created_at=existing["created_at"],
+                id=existing["id"],
+                name=name,
+                created_at=existing["created_at"],
                 last_heartbeat=now,
                 metadata=metadata if metadata is not None else existing["metadata"],
                 team_name=team_name if team_name is not None else existing["team_name"],
@@ -46,8 +46,12 @@ async def register_session(
         )
         await db.commit()
         return Session(
-            id=session_id, name=name, created_at=now,
-            last_heartbeat=now, metadata=metadata, team_name=team_name,
+            id=session_id,
+            name=name,
+            created_at=now,
+            last_heartbeat=now,
+            metadata=metadata,
+            team_name=team_name,
         )
     finally:
         await db.close()
@@ -57,17 +61,20 @@ async def heartbeat(name: str) -> Session:
     db = await get_connection()
     try:
         now = _now()
-        await db.execute(
-            "UPDATE sessions SET last_heartbeat = ? WHERE name = ?", (now, name)
-        )
+        await db.execute("UPDATE sessions SET last_heartbeat = ? WHERE name = ?", (now, name))
         await db.commit()
         row = await db.execute_fetchall("SELECT * FROM sessions WHERE name = ?", (name,))
         if not row:
             raise ValueError(f"Session '{name}' not found")
         r = row[0]
-        return Session(id=r["id"], name=r["name"], created_at=r["created_at"],
-                       last_heartbeat=r["last_heartbeat"], metadata=r["metadata"],
-                       team_name=r["team_name"])
+        return Session(
+            id=r["id"],
+            name=r["name"],
+            created_at=r["created_at"],
+            last_heartbeat=r["last_heartbeat"],
+            metadata=r["metadata"],
+            team_name=r["team_name"],
+        )
     finally:
         await db.close()
 
@@ -83,9 +90,14 @@ async def list_sessions(include_stale: bool = False) -> list[Session]:
                 (f"-{STALE_MINUTES} minutes",),
             )
         return [
-            Session(id=r["id"], name=r["name"], created_at=r["created_at"],
-                    last_heartbeat=r["last_heartbeat"], metadata=r["metadata"],
-                    team_name=r["team_name"])
+            Session(
+                id=r["id"],
+                name=r["name"],
+                created_at=r["created_at"],
+                last_heartbeat=r["last_heartbeat"],
+                metadata=r["metadata"],
+                team_name=r["team_name"],
+            )
             for r in rows
         ]
     finally:

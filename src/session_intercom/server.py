@@ -74,6 +74,7 @@ async def intercom_register(
         result: dict = {"status": "registered", "session": asdict(session)}
         if team_name:
             from .inbox import ensure_inbox, inbox_stats
+
             result["inbox_file_ready"] = ensure_inbox(team_name)
             if not result["inbox_file_ready"]:
                 result["delivery_health"] = "no_inbox"
@@ -139,13 +140,15 @@ async def intercom_send(
     try:
         sender = _resolve_name(from_name)
         msg = await db.send_message(sender, to_name, body, thread_id)
-        return _json({
-            "status": "sent",
-            "message_id": msg.id,
-            "from": sender,
-            "to": to_name,
-            "created_at": msg.created_at,
-        })
+        return _json(
+            {
+                "status": "sent",
+                "message_id": msg.id,
+                "from": sender,
+                "to": to_name,
+                "created_at": msg.created_at,
+            }
+        )
     except ValueError as e:
         return _json({"error": str(e)})
 
@@ -170,13 +173,15 @@ async def intercom_broadcast(
     try:
         sender = _resolve_name(from_name)
         msg = await db.broadcast_message(sender, body, channel, thread_id)
-        return _json({
-            "status": "broadcast",
-            "message_id": msg.id,
-            "from": sender,
-            "channel": channel,
-            "created_at": msg.created_at,
-        })
+        return _json(
+            {
+                "status": "broadcast",
+                "message_id": msg.id,
+                "from": sender,
+                "channel": channel,
+                "created_at": msg.created_at,
+            }
+        )
     except ValueError as e:
         return _json({"error": str(e)})
 
@@ -203,11 +208,13 @@ async def intercom_poll(
     try:
         session_name = _resolve_name(name)
         messages, remaining = await db.poll_messages(session_name, mark_read, limit, channel)
-        return _json({
-            "messages": [asdict(m) for m in messages],
-            "count": len(messages),
-            "remaining": remaining,
-        })
+        return _json(
+            {
+                "messages": [asdict(m) for m in messages],
+                "count": len(messages),
+                "remaining": remaining,
+            }
+        )
     except ValueError as e:
         return _json({"error": str(e)})
 
@@ -220,10 +227,12 @@ async def intercom_list_sessions(include_stale: bool = False) -> str:
         include_stale: Include sessions with no recent heartbeat (default: false).
     """
     sessions = await db.list_sessions(include_stale)
-    return _json({
-        "sessions": [asdict(s) for s in sessions],
-        "count": len(sessions),
-    })
+    return _json(
+        {
+            "sessions": [asdict(s) for s in sessions],
+            "count": len(sessions),
+        }
+    )
 
 
 @mcp.tool()
@@ -250,11 +259,15 @@ async def intercom_history(
     """
     try:
         session_name = _resolve_name(name)
-        messages = await db.get_history(session_name, with_session, channel, thread_id, limit, before_id)
-        return _json({
-            "messages": [asdict(m) for m in messages],
-            "count": len(messages),
-        })
+        messages = await db.get_history(
+            session_name, with_session, channel, thread_id, limit, before_id
+        )
+        return _json(
+            {
+                "messages": [asdict(m) for m in messages],
+                "count": len(messages),
+            }
+        )
     except ValueError as e:
         return _json({"error": str(e)})
 
@@ -263,10 +276,12 @@ async def intercom_history(
 async def intercom_list_channels() -> str:
     """List all available channels."""
     channels = await db.list_channels()
-    return _json({
-        "channels": [asdict(c) for c in channels],
-        "count": len(channels),
-    })
+    return _json(
+        {
+            "channels": [asdict(c) for c in channels],
+            "count": len(channels),
+        }
+    )
 
 
 @mcp.tool()
@@ -321,6 +336,7 @@ async def intercom_diagnose(name: str | None = None) -> str:
         return _json(result)
 
     from .inbox import inbox_stats
+
     stats = inbox_stats(team_name)
     result["inbox_stats"] = stats
 
@@ -371,12 +387,14 @@ async def intercom_cleanup(ttl_minutes: int = db.CLEANUP_MINUTES) -> str:
         ttl_minutes: Minutes of inactivity before a session is considered stale.
     """
     removed = await db.cleanup_sessions(ttl_minutes)
-    return _json({
-        "status": "cleaned",
-        "removed": removed,
-        "count": len(removed),
-        "ttl_minutes": ttl_minutes,
-    })
+    return _json(
+        {
+            "status": "cleaned",
+            "removed": removed,
+            "count": len(removed),
+            "ttl_minutes": ttl_minutes,
+        }
+    )
 
 
 def main():

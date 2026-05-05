@@ -47,19 +47,22 @@ from .sessions import (
 # Mutable constants live in _common; proxying them via __getattr__ keeps
 # `db.DB_PATH` always in sync with `_common.DB_PATH`. Without this, tests
 # that monkeypatch _common.DB_PATH wouldn't affect callers reading db.DB_PATH.
-_PROXIED_CONSTANTS = frozenset({
-    "CLEANUP_MINUTES",
-    "DB_DIR",
-    "DB_PATH",
-    "MAX_BODY_SIZE",
-    "NAME_RE",
-    "STALE_MINUTES",
-})
+_PROXIED_CONSTANTS = frozenset(
+    {
+        "CLEANUP_MINUTES",
+        "DB_DIR",
+        "DB_PATH",
+        "MAX_BODY_SIZE",
+        "NAME_RE",
+        "STALE_MINUTES",
+    }
+)
 
 
 def __getattr__(name: str):
     if name in _PROXIED_CONSTANTS:
         from . import _common
+
         return getattr(_common, name)
     raise AttributeError(f"module 'session_intercom.db' has no attribute {name!r}")
 

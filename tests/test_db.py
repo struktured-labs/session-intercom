@@ -215,7 +215,9 @@ async def test_poll_updates_heartbeat():
 
     conn = await db.get_connection()
     try:
-        rows = await conn.execute_fetchall("SELECT last_heartbeat FROM sessions WHERE name = 'alice'")
+        rows = await conn.execute_fetchall(
+            "SELECT last_heartbeat FROM sessions WHERE name = 'alice'"
+        )
         new_hb = rows[0]["last_heartbeat"]
         assert new_hb >= old_hb
     finally:

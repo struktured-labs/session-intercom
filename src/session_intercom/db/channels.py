@@ -11,7 +11,9 @@ async def list_channels() -> list[Channel]:
     try:
         rows = await db.execute_fetchall("SELECT * FROM channels ORDER BY name")
         return [
-            Channel(id=r["id"], name=r["name"], created_at=r["created_at"], description=r["description"])
+            Channel(
+                id=r["id"], name=r["name"], created_at=r["created_at"], description=r["description"]
+            )
             for r in rows
         ]
     finally:
@@ -29,6 +31,8 @@ async def create_channel(name: str, description: str | None = None) -> Channel:
         await db.commit()
         row = await db.execute_fetchall("SELECT * FROM channels WHERE id = ?", (cursor.lastrowid,))
         r = row[0]
-        return Channel(id=r["id"], name=r["name"], created_at=r["created_at"], description=r["description"])
+        return Channel(
+            id=r["id"], name=r["name"], created_at=r["created_at"], description=r["description"]
+        )
     finally:
         await db.close()

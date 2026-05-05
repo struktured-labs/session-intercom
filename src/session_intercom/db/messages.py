@@ -43,14 +43,21 @@ async def send_message(
         # Bridge to native inbox if recipient has a team
         if recipient.get("team_name"):
             write_to_inbox(
-                recipient["team_name"], from_name, body,
+                recipient["team_name"],
+                from_name,
+                body,
                 summary=f"intercom DM from {from_name}",
             )
 
         return Message(
-            id=msg_id, sender_id=sender["id"], sender_name=from_name,
-            recipient_id=recipient["id"], recipient_name=to_name,
-            body=body, thread_id=thread_id, created_at=created_at,
+            id=msg_id,
+            sender_id=sender["id"],
+            sender_name=from_name,
+            recipient_id=recipient["id"],
+            recipient_name=to_name,
+            body=body,
+            thread_id=thread_id,
+            created_at=created_at,
         )
     finally:
         await db.close()
@@ -72,7 +79,9 @@ async def broadcast_message(
         # Verify channel exists
         rows = await db.execute_fetchall("SELECT name FROM channels WHERE name = ?", (channel,))
         if not rows:
-            raise ValueError(f"Channel '{channel}' not found. Create it with intercom_create_channel.")
+            raise ValueError(
+                f"Channel '{channel}' not found. Create it with intercom_create_channel."
+            )
 
         if thread_id is not None:
             rows = await db.execute_fetchall("SELECT id FROM messages WHERE id = ?", (thread_id,))
@@ -97,13 +106,20 @@ async def broadcast_message(
         )
         for tr in team_rows:
             write_to_inbox(
-                tr["team_name"], from_name, body,
+                tr["team_name"],
+                from_name,
+                body,
                 summary=f"[{channel}] {from_name}",
             )
 
         return Message(
-            id=msg_id, sender_id=sender["id"], sender_name=from_name,
-            channel=channel, body=body, thread_id=thread_id, created_at=created_at,
+            id=msg_id,
+            sender_id=sender["id"],
+            sender_name=from_name,
+            channel=channel,
+            body=body,
+            thread_id=thread_id,
+            created_at=created_at,
         )
     finally:
         await db.close()
@@ -145,9 +161,7 @@ async def poll_messages(
         await db.close()
 
 
-async def _poll_dms(
-    db: aiosqlite.Connection, session_id: str, limit: int
-) -> list[Message]:
+async def _poll_dms(db: aiosqlite.Connection, session_id: str, limit: int) -> list[Message]:
     rows = await db.execute_fetchall(
         """
         SELECT m.*, s.name AS sender_name

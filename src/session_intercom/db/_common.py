@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import aiosqlite
@@ -13,8 +13,8 @@ DB_PATH = DB_DIR / "intercom.db"
 
 MAX_BODY_SIZE = 32768
 NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
-STALE_MINUTES = 20160      # 2 weeks
-CLEANUP_MINUTES = 20160    # 2 weeks
+STALE_MINUTES = 20160  # 2 weeks
+CLEANUP_MINUTES = 20160  # 2 weeks
 
 SCHEMA = """\
 CREATE TABLE IF NOT EXISTS sessions (
@@ -69,7 +69,7 @@ ALTER TABLE sessions ADD COLUMN team_name TEXT;
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def validate_name(name: str) -> None:
