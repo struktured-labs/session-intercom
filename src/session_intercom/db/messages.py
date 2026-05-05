@@ -1,0 +1,303 @@
+"""Message routing: send, broadcast, poll, history. Refreshes sender heartbeat."""
+
+from __future__ import annotations
+
+import aiosqlite
+
+from ..inbox import write_to_inbox
+from ..models import Message
+from ._common import _now, get_connection, validate_body
+from .sessions import get_session_by_name
+
+
+async def send_message(
+    from_name: str, to_name: str, body: str, thread_id: int | None = None
+) -> Message:
+    validate_body(body)
+    db = await get_connection()
+    try:
+        sender = await get_session_by_name(db, from_name)
+        recipient = await get_session_by_name(db, to_name)
+
+        # Update sender heartbeat
+        await db.execute(
+            "UPDATE sessions SET last_heartbeat = ? WHERE id = ?", (_now(), sender["id"])
+        )
+
+        if thread_id is not None:
+            rows = await db.execute_fetchall("SELECT id FROM messages WHERE id = ?", (thread_id,))
+            if not rows:
+                raise ValueError(f"Thread root message {thread_id} not found")
+
+        cursor = await db.execute(
+            "INSERT INTO messages (sender_id, recipient_id, body, thread_id) VALUES (?, ?, ?, ?)",
+            (sender["id"], recipient["id"], body, thread_id),
+        )
+        msg_id = cursor.lastrowid
+        assert msg_id is not None, "INSERT must produce a rowid"
+        await db.commit()
+
+        row = await db.execute_fetchall("SELECT created_at FROM messages WHERE id = ?", (msg_id,))
+        created_at = row[0]["created_at"] if row else _now()
+
+        # Bridge to native inbox if recipient has a team
+        if recipient.get("team_name"):
+            write_to_inbox(
+                recipient["team_name"], from_name, body,
+                summary=f"intercom DM from {from_name}",
+            )
+
+        return Message(
+            id=msg_id, sender_id=sender["id"], sender_name=from_name,
+            recipient_id=recipient["id"], recipient_name=to_name,
+            body=body, thread_id=thread_id, created_at=created_at,
+        )
+    finally:
+        await db.close()
+
+
+async def broadcast_message(
+    from_name: str, body: str, channel: str = "general", thread_id: int | None = None
+) -> Message:
+    validate_body(body)
+    db = await get_connection()
+    try:
+        sender = await get_session_by_name(db, from_name)
+
+        # Update sender heartbeat
+        await db.execute(
+            "UPDATE sessions SET last_heartbeat = ? WHERE id = ?", (_now(), sender["id"])
+        )
+
+        # Verify channel exists
+        rows = await db.execute_fetchall("SELECT name FROM channels WHERE name = ?", (channel,))
+        if not rows:
+            raise ValueError(f"Channel '{channel}' not found. Create it with intercom_create_channel.")
+
+        if thread_id is not None:
+            rows = await db.execute_fetchall("SELECT id FROM messages WHERE id = ?", (thread_id,))
+            if not rows:
+                raise ValueError(f"Thread root message {thread_id} not found")
+
+        cursor = await db.execute(
+            "INSERT INTO messages (sender_id, channel, body, thread_id) VALUES (?, ?, ?, ?)",
+            (sender["id"], channel, body, thread_id),
+        )
+        msg_id = cursor.lastrowid
+        assert msg_id is not None, "INSERT must produce a rowid"
+        await db.commit()
+
+        row = await db.execute_fetchall("SELECT created_at FROM messages WHERE id = ?", (msg_id,))
+        created_at = row[0]["created_at"] if row else _now()
+
+        # Bridge broadcast to native inboxes for all sessions with teams (except sender)
+        team_rows = await db.execute_fetchall(
+            "SELECT team_name FROM sessions WHERE team_name IS NOT NULL AND id != ?",
+            (sender["id"],),
+        )
+        for tr in team_rows:
+            write_to_inbox(
+                tr["team_name"], from_name, body,
+                summary=f"[{channel}] {from_name}",
+            )
+
+        return Message(
+            id=msg_id, sender_id=sender["id"], sender_name=from_name,
+            channel=channel, body=body, thread_id=thread_id, created_at=created_at,
+        )
+    finally:
+        await db.close()
+
+
+async def poll_messages(
+    name: str, mark_read: bool = True, limit: int = 50, channel: str | None = None
+) -> tuple[list[Message], int]:
+    limit = min(max(limit, 1), 200)
+    db = await get_connection()
+    try:
+        session = await get_session_by_name(db, name)
+        session_id = session["id"]
+
+        # Update heartbeat
+        await db.execute(
+            "UPDATE sessions SET last_heartbeat = ? WHERE id = ?", (_now(), session_id)
+        )
+
+        messages: list[Message] = []
+
+        if channel:
+            messages.extend(await _poll_channel(db, session_id, channel, limit))
+        else:
+            messages.extend(await _poll_dms(db, session_id, limit))
+            messages.extend(await _poll_all_channels(db, session_id, limit))
+
+        # Sort by id (monotonic order) and apply limit
+        messages.sort(key=lambda m: m.id)
+        result = messages[:limit]
+        remaining = len(messages) - len(result)
+
+        if mark_read and result:
+            await _advance_cursors(db, session_id, result)
+
+        await db.commit()
+        return result, remaining
+    finally:
+        await db.close()
+
+
+async def _poll_dms(
+    db: aiosqlite.Connection, session_id: str, limit: int
+) -> list[Message]:
+    rows = await db.execute_fetchall(
+        """
+        SELECT m.*, s.name AS sender_name
+        FROM messages m
+        JOIN sessions s ON s.id = m.sender_id
+        WHERE m.recipient_id = ? AND m.channel IS NULL
+          AND m.id > COALESCE(
+            (SELECT last_read_id FROM read_cursors WHERE session_id = ? AND source = m.sender_id), 0
+          )
+        ORDER BY m.id
+        LIMIT ?
+        """,
+        (session_id, session_id, limit),
+    )
+    return [_row_to_message(r) for r in rows]
+
+
+async def _poll_channel(
+    db: aiosqlite.Connection, session_id: str, channel: str, limit: int
+) -> list[Message]:
+    rows = await db.execute_fetchall(
+        """
+        SELECT m.*, s.name AS sender_name
+        FROM messages m
+        JOIN sessions s ON s.id = m.sender_id
+        WHERE m.channel = ? AND m.sender_id != ?
+          AND m.id > COALESCE(
+            (SELECT last_read_id FROM read_cursors WHERE session_id = ? AND source = ?), 0
+          )
+        ORDER BY m.id
+        LIMIT ?
+        """,
+        (channel, session_id, session_id, f"ch:{channel}", limit),
+    )
+    return [_row_to_message(r) for r in rows]
+
+
+async def _poll_all_channels(
+    db: aiosqlite.Connection, session_id: str, limit: int
+) -> list[Message]:
+    rows = await db.execute_fetchall(
+        """
+        SELECT m.*, s.name AS sender_name
+        FROM messages m
+        JOIN sessions s ON s.id = m.sender_id
+        WHERE m.channel IS NOT NULL AND m.sender_id != ?
+          AND m.id > COALESCE(
+            (SELECT last_read_id FROM read_cursors
+             WHERE session_id = ? AND source = 'ch:' || m.channel), 0
+          )
+        ORDER BY m.id
+        LIMIT ?
+        """,
+        (session_id, session_id, limit),
+    )
+    return [_row_to_message(r) for r in rows]
+
+
+async def _advance_cursors(
+    db: aiosqlite.Connection, session_id: str, messages: list[Message]
+) -> None:
+    dm_max: dict[str, int] = {}
+    ch_max: dict[str, int] = {}
+    for m in messages:
+        if m.channel:
+            key = f"ch:{m.channel}"
+            ch_max[key] = max(ch_max.get(key, 0), m.id)
+        else:
+            dm_max[m.sender_id] = max(dm_max.get(m.sender_id, 0), m.id)
+
+    for source, max_id in {**dm_max, **ch_max}.items():
+        await db.execute(
+            """
+            INSERT INTO read_cursors (session_id, source, last_read_id)
+            VALUES (?, ?, ?)
+            ON CONFLICT (session_id, source)
+            DO UPDATE SET last_read_id = MAX(read_cursors.last_read_id, excluded.last_read_id)
+            """,
+            (session_id, source, max_id),
+        )
+
+
+def _row_to_message(r: aiosqlite.Row) -> Message:
+    return Message(
+        id=r["id"],
+        sender_id=r["sender_id"],
+        sender_name=r["sender_name"],
+        recipient_id=r["recipient_id"],
+        body=r["body"],
+        channel=r["channel"],
+        thread_id=r["thread_id"],
+        created_at=r["created_at"],
+    )
+
+
+async def get_history(
+    name: str,
+    with_session: str | None = None,
+    channel: str | None = None,
+    thread_id: int | None = None,
+    limit: int = 50,
+    before_id: int | None = None,
+) -> list[Message]:
+    limit = min(max(limit, 1), 200)
+    db = await get_connection()
+    try:
+        session = await get_session_by_name(db, name)
+        session_id = session["id"]
+
+        conditions = []
+        params: list = []
+
+        if thread_id is not None:
+            conditions.append("(m.id = ? OR m.thread_id = ?)")
+            params.extend([thread_id, thread_id])
+        elif with_session:
+            other = await get_session_by_name(db, with_session)
+            other_id = other["id"]
+            conditions.append(
+                "((m.sender_id = ? AND m.recipient_id = ?) OR (m.sender_id = ? AND m.recipient_id = ?))"
+            )
+            params.extend([session_id, other_id, other_id, session_id])
+            conditions.append("m.channel IS NULL")
+        elif channel:
+            conditions.append("m.channel = ?")
+            params.append(channel)
+        else:
+            conditions.append(
+                "(m.recipient_id = ? OR m.sender_id = ? OR (m.channel IS NOT NULL AND m.sender_id != ?))"
+            )
+            params.extend([session_id, session_id, session_id])
+
+        if before_id is not None:
+            conditions.append("m.id < ?")
+            params.append(before_id)
+
+        where = " AND ".join(conditions) if conditions else "1=1"
+        params.append(limit)
+
+        rows = await db.execute_fetchall(
+            f"""
+            SELECT m.*, s.name AS sender_name
+            FROM messages m
+            JOIN sessions s ON s.id = m.sender_id
+            WHERE {where}
+            ORDER BY m.id DESC
+            LIMIT ?
+            """,
+            params,
+        )
+        return [_row_to_message(r) for r in reversed(list(rows))]
+    finally:
+        await db.close()
