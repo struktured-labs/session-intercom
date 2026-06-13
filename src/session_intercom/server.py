@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 
@@ -86,18 +87,32 @@ async def intercom_register(
             else:
                 stats = inbox_stats(team_name)
                 unread = stats["unread_messages"] if stats else 0
-                if unread > 0:
-                    # Stale-binding heuristic: if messages have been sitting in
-                    # the file inbox unread, the CLI's InboxPoller for THIS
-                    # conversation almost certainly isn't bound — most often
-                    # because the team config's leadSessionId was set by a
-                    # prior conversation.
+                lead_sid = stats.get("lead_session_id") if stats else None
+                current_sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
+                # Stale-binding by leadSessionId: the InboxPoller is bound to
+                # whichever conversation's session ID is the team's lead. If
+                # this MCP child's parent session differs, inbound delivery
+                # will silently drop even when the inbox is empty.
+                binding_mismatch = bool(current_sid and lead_sid and current_sid != lead_sid)
+                if binding_mismatch or unread > 0:
                     result["delivery_health"] = "likely_broken"
-                    result["unread_in_file_inbox"] = unread
+                    if unread > 0:
+                        result["unread_in_file_inbox"] = unread
+                    if binding_mismatch:
+                        result["binding_mismatch"] = {
+                            "team_lead_session_id": lead_sid,
+                            "this_session_id": current_sid,
+                        }
+                    cause = (
+                        f"team config's leadSessionId ({lead_sid}) does not "
+                        f"match this conversation's session ID ({current_sid}) "
+                        f"— InboxPoller is bound to a different session"
+                        if binding_mismatch
+                        else f"file inbox has {unread} unread message(s) that "
+                        f"never got delivered (leadSessionId likely stale)"
+                    )
                     result["recovery"] = (
-                        f"File inbox has {unread} unread message(s) — native "
-                        f"delivery is likely broken (common cause: previous "
-                        f"conversation's leadSessionId still in team config).\n"
+                        f"Native delivery is likely broken — {cause}.\n"
                         f"\nRecovery (no Claude restart needed):\n"
                         f"  1. TeamDelete()\n"
                         f"  2. TeamCreate(team_name='{team_name}')\n"

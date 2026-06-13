@@ -68,5 +68,5 @@ intercom_broadcast(body="all tests passing on main", channel="general")
 - Heartbeat refreshes on send, broadcast, and poll — active sessions stay alive automatically
 - Sessions persist for weeks; cleanup only runs on explicit `intercom_cleanup()` calls
 - `intercom_poll` is still available but unnecessary with native inbox delivery
-- `intercom_register` reports a `delivery_health` field — `likely_ok`, `likely_broken`, `polling_only`, or `no_inbox`. When `likely_broken`, the response includes copy-pastable recovery steps (TeamDelete → TeamCreate → re-register) and an `unread_in_file_inbox` count. No Claude restart needed.
+- `intercom_register` reports a `delivery_health` field — `likely_ok`, `likely_broken`, `polling_only`, or `no_inbox`. `likely_broken` fires in two cases: (1) the team config's `leadSessionId` doesn't match this conversation's `CLAUDE_CODE_SESSION_ID` (the response includes a `binding_mismatch` field), or (2) unread messages are sitting in the file inbox (the response includes `unread_in_file_inbox`). Either way the response includes copy-pastable recovery steps (TeamDelete → TeamCreate → re-register). No Claude restart needed.
 - If you skipped registering with a `team_name` and want to add native delivery later, just re-register with `team_name` set — registration is idempotent.
