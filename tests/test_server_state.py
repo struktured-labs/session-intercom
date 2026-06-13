@@ -197,3 +197,106 @@ async def test_register_with_unread_inbox_reports_likely_broken(fake_teams_dir):
     assert "TeamCreate(team_name='alice')" in parsed["recovery"]
     assert "intercom_register(name='alice', team_name='alice')" in parsed["recovery"]
     assert "intercom_poll" in parsed["recovery"]
+
+
+# --- leadSessionId binding mismatch detection ---
+
+
+def _create_team_dir_with_lead(fake_teams_dir: Path, team_name: str, lead_session_id: str) -> Path:
+    """Simulate TeamCreate with a specific leadSessionId baked in."""
+    team_dir = fake_teams_dir / team_name
+    (team_dir / "inboxes").mkdir(parents=True, exist_ok=True)
+    (team_dir / "config.json").write_text(
+        json.dumps({"name": team_name, "leadSessionId": lead_session_id})
+    )
+    return team_dir
+
+
+@pytest.mark.asyncio
+async def test_register_detects_stale_lead_session_id(
+    fake_teams_dir, monkeypatch: pytest.MonkeyPatch
+):
+    """Empty inbox + stale leadSessionId still reports likely_broken.
+
+    The original heuristic only fired when unread > 0, missing the common
+    fresh-setup case: new conversation reuses an existing team whose
+    leadSessionId is still bound to a different (dead or live) conversation.
+    """
+    _create_team_dir_with_lead(fake_teams_dir, "alice", "old-conversation-sid")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "this-conversation-sid")
+
+    await db.init_db()
+    out = await server.intercom_register("alice", team_name="alice")
+    parsed = json.loads(out)
+
+    assert parsed["delivery_health"] == "likely_broken"
+    assert parsed["binding_mismatch"] == {
+        "team_lead_session_id": "old-conversation-sid",
+        "this_session_id": "this-conversation-sid",
+    }
+    # Inbox is empty so this field should not appear.
+    assert "unread_in_file_inbox" not in parsed
+    # Recovery still gives the standard TeamDelete → TeamCreate → re-register loop.
+    assert "TeamDelete" in parsed["recovery"]
+    assert "TeamCreate(team_name='alice')" in parsed["recovery"]
+
+
+@pytest.mark.asyncio
+async def test_register_matching_session_id_reports_likely_ok(
+    fake_teams_dir, monkeypatch: pytest.MonkeyPatch
+):
+    """Matching session IDs → likely_ok, no binding_mismatch flag."""
+    _create_team_dir_with_lead(fake_teams_dir, "alice", "same-sid")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "same-sid")
+
+    await db.init_db()
+    out = await server.intercom_register("alice", team_name="alice")
+    parsed = json.loads(out)
+
+    assert parsed["delivery_health"] == "likely_ok"
+    assert "binding_mismatch" not in parsed
+    assert "recovery" not in parsed
+
+
+@pytest.mark.asyncio
+async def test_register_without_env_var_falls_back_to_unread_heuristic(
+    fake_teams_dir, monkeypatch: pytest.MonkeyPatch
+):
+    """Without CLAUDE_CODE_SESSION_ID, mismatch can't be detected; rely on unread count.
+
+    Empty inbox + no env var → likely_ok, since we have no other signal.
+    """
+    _create_team_dir_with_lead(fake_teams_dir, "alice", "some-sid")
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+
+    await db.init_db()
+    out = await server.intercom_register("alice", team_name="alice")
+    parsed = json.loads(out)
+
+    assert parsed["delivery_health"] == "likely_ok"
+    assert "binding_mismatch" not in parsed
+
+
+@pytest.mark.asyncio
+async def test_register_binding_mismatch_and_unread_both_surface(
+    fake_teams_dir, monkeypatch: pytest.MonkeyPatch
+):
+    """Both signals present → mismatch detail wins in the cause text, unread still reported."""
+    _create_team_dir_with_lead(fake_teams_dir, "alice", "old-sid")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "new-sid")
+    inbox_file = fake_teams_dir / "alice" / "inboxes" / "team-lead.json"
+    inbox_file.write_text(
+        json.dumps(
+            [{"from": "bob", "text": "hi", "timestamp": "2024-01-01T00:00:00Z", "read": False}]
+        )
+    )
+
+    await db.init_db()
+    out = await server.intercom_register("alice", team_name="alice")
+    parsed = json.loads(out)
+
+    assert parsed["delivery_health"] == "likely_broken"
+    assert parsed["unread_in_file_inbox"] == 1
+    assert parsed["binding_mismatch"]["team_lead_session_id"] == "old-sid"
+    # When both signals fire, the cause text leads with the mismatch (more diagnostic).
+    assert "leadSessionId" in parsed["recovery"]

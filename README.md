@@ -169,6 +169,8 @@ Verdict will be one of:
 - `no_team_config` — `TeamCreate` was never called for this name
 - `no_team` — session was registered without a `team_name`
 
+Note: as of 0.5.0, `intercom_register` itself catches the empty-inbox case too — it compares `CLAUDE_CODE_SESSION_ID` (set in the MCP child's env by Claude Code) to the team's `leadSessionId` on disk. When they differ, the response returns `delivery_health: likely_broken` with a `binding_mismatch` field even when no messages have arrived yet, so fresh-setup failures surface at setup time instead of after the first missed inbound.
+
 If broken, recover **without restarting Claude**:
 
 1. `TeamDelete()` in the broken session (no args; operates on the current team). Clears the in-process binding and wipes `~/.claude/teams/<name>/`.
