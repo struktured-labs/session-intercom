@@ -2,7 +2,7 @@
 
 Re-exports the public API so callers can keep using `from .. import db` and
 `db.register_session(...)` exactly as before. Internal modules are organized
-by concern (sessions / messages / channels / diagnose / cleanup) on top of
+by concern (sessions / messages / channels / cleanup) on top of
 the shared connection + schema in `_common`.
 """
 
@@ -30,7 +30,6 @@ if TYPE_CHECKING:
     )
 from .channels import create_channel, list_channels
 from .cleanup import cleanup_sessions
-from .diagnose import diagnose_session
 from .messages import (
     broadcast_message,
     get_history,
@@ -93,8 +92,6 @@ __all__ = [
     # channels
     "list_channels",
     "create_channel",
-    # diagnose
-    "diagnose_session",
     # cleanup
     "cleanup_sessions",
 ]

@@ -1,25 +1,20 @@
 # session-intercom
 
-MCP server for P2P communication between independent Claude Code sessions. Messages are delivered directly to Claude's native inbox with zero polling — no `/loop`, no token bleed.
+MCP server for P2P communication between independent Claude Code sessions. Messages arrive as `<channel>` tags between turns over the native MCP transport — zero polling, no file inbox, no `leadSessionId` binding to break.
 
 ## The problem
 
 Claude Code has no built-in way for independent sessions to talk to each other. Agent Teams only work within a single parent session. If you have 5 sessions working on different parts of a project, they can't coordinate.
 
-session-intercom solves this with an MCP server that provides named session registration, direct messaging, broadcast channels, threading, and message history — all backed by SQLite.
-
-**With the native inbox bridge**, messages land in Claude's built-in `InboxPoller` and get delivered between turns automatically, just like teammate messages. No polling tool calls eating your context.
+session-intercom solves this with an MCP server that registers named sessions, routes DMs and broadcast channels through shared SQLite state, and pushes inbound messages into each session as **Claude Code channel notifications** (`notifications/claude/channel`). The recipient sees them as `<channel source="session-intercom" from="alice" ...>body</channel>` tags injected between turns, like teammate messages.
 
 ## Quick start
 
 ### 1. Install
 
 ```bash
-# Clone
 git clone git@github.com:struktured-labs/session-intercom.git
 cd session-intercom
-
-# Install with uv
 uv sync
 ```
 
@@ -33,12 +28,7 @@ Add to `~/.claude.json` (or `~/.claude/mcp.json`):
     "session-intercom": {
       "type": "stdio",
       "command": "uv",
-      "args": [
-        "run",
-        "--directory",
-        "/path/to/session-intercom",
-        "session-intercom"
-      ]
+      "args": ["run", "--directory", "/path/to/session-intercom", "session-intercom"]
     }
   }
 }
@@ -49,101 +39,104 @@ Add permissions in `~/.claude/settings.json`:
 ```json
 {
   "permissions": {
-    "allow": [
-      "mcp__session-intercom__*"
-    ]
+    "allow": ["mcp__session-intercom__*"]
   }
 }
 ```
 
-### 3. Session startup (two lines)
+### 3. Launch Claude Code with channels enabled
 
-Every Claude Code session that wants to receive messages runs these at startup:
+session-intercom uses the [Channels API](https://code.claude.com/docs/en/channels-reference), currently in research preview. Custom channels aren't on Anthropic's allowlist, so launch with:
+
+```bash
+claude --dangerously-load-development-channels server:session-intercom
+```
+
+The first session in a project shows a one-time consent prompt. After that, channels are active for that session for as long as the flag is in the launch command.
+
+### 4. Register the session
+
+Just one call — no `TeamCreate`, no `team_name`:
 
 ```
-TeamCreate("my-session-name")
-intercom_register("my-session-name", team_name="my-session-name")
+intercom_register(name="my-session-name")
 ```
 
-That's it. The session now has:
-- A personal team (activates the CLI's built-in InboxPoller)
-- An intercom registration with native inbox delivery
+### 5. Send messages
 
-### 4. Send messages
-
-From any registered session — your own name is implicit after registration:
+Your own name is implicit after register:
 
 ```
 intercom_send(to_name="recipient-name", body="Your message here")
 ```
 
-The recipient gets the message delivered automatically between turns. No `/loop`, no `intercom_poll` needed.
+The recipient's next turn includes the message as a `<channel source="session-intercom" from="my-session-name" message_id="42">Your message here</channel>` tag. No polling, no file inbox, no waiting on the CLI's old `InboxPoller`.
 
 ## How it works
 
 ```
-Session A                          Session B
-    |                                  |
-    | intercom_send("A", "B", "hi")    |
-    |           |                      |
-    |     [intercom MCP]               |
-    |       |         |                |
-    |   [SQLite]   [inbox file]        |
-    |              ~/.claude/teams/    |
-    |              B/inboxes/          |
-    |              team-lead.json      |
-    |                  |               |
-    |            [InboxPoller ~1s]     |
-    |                  |               |
-    |                  +---> delivered  |
+Session A                                    Session B
+    |                                            |
+    | intercom_send(to_name="B", body="hi")      |
+    |             |                              |
+    |     [intercom MCP A]                       |
+    |             |                              |
+    |        [SQLite intercom.db]                |
+    |             ^                              |
+    |             | poll once / sec              |
+    |             |                              |
+    |     [intercom MCP B — tailer task]         |
+    |             |                              |
+    |             | notifications/claude/channel |
+    |             v                              |
+    |     [Claude Code B]                        |
+    |             |                              |
+    |             +------> <channel ...>hi</channel> arrives between turns
 ```
 
-1. Sender calls `intercom_send` via MCP
-2. Intercom writes to SQLite (history, threading, cursors) AND the recipient's native inbox file
-3. Claude CLI's built-in `InboxPoller` picks up the message within ~1 second
-4. Message delivered as a teammate notification — appears between turns like a user message
+1. Sender's MCP inserts a row into the shared `intercom.db`
+2. Recipient's MCP runs a background tailer that polls the DB for messages addressed to its registered session
+3. For each new message, the tailer emits `notifications/claude/channel` directly on its stdio write stream
+4. Claude Code injects the notification as a `<channel>` tag on the next turn — same path as teammate messages
 
 ## MCP tools
 
 | Tool | Purpose |
 |------|---------|
-| `intercom_register(name, team_name=...)` | Register + set this name as the session's identity for all later calls |
+| `intercom_register(name)` | Register and set this name as the session's identity for all later calls |
 | `intercom_send(to_name, body)` | Direct message — your own name is implicit |
 | `intercom_broadcast(body, channel="general")` | Broadcast to a channel |
-| `intercom_poll()` | Manual drain (rarely needed with native inbox) |
+| `intercom_poll()` | Manual drain (rarely needed — channels deliver automatically) |
 | `intercom_list_sessions()` | Discover registered sessions |
 | `intercom_history(...)` | Read-only message history with pagination |
-| `intercom_list_channels()` | List available channels |
+| `intercom_list_channels()` | List available broadcast channels |
 | `intercom_create_channel(channel_name)` | Create a new broadcast channel |
-| `intercom_diagnose()` | Check whether native inbox delivery is actually working |
 | `intercom_cleanup(ttl_minutes=...)` | Remove sessions inactive for 2+ weeks (default) |
 
 ## Features
 
-- **Native inbox delivery** — zero-polling message receipt via Claude's built-in InboxPoller
-- **Direct messages** — P2P between named sessions
-- **Broadcast channels** — pub/sub with named channels (default: `general`)
+- **Channels-API delivery** — Claude Code receives messages as native MCP `<channel>` tags between turns, no polling
+- **One-call setup** — just `intercom_register(name)`, no `TeamCreate` dance
+- **Direct messages + broadcast channels** — pub/sub with named channels (default: `general`)
 - **Threading** — reply to specific messages with `thread_id`
 - **Message history** — paginated history with `before_id` cursor
 - **Read cursors** — efficient tracking of unread messages per session
 - **Idempotent registration** — re-register anytime without errors; crashed sessions just reconnect
-- **Session discovery** — list active sessions with heartbeat status
-- **Explicit cleanup only** — sessions persist for weeks; cleanup runs only when you ask for it
-- **Concurrent-safe** — SQLite WAL mode + flock on inbox files
+- **Durable sessions** — two-week TTL, explicit `intercom_cleanup()` only
+- **Concurrent-safe** — SQLite WAL mode
 
 ## Architecture
 
 ```
 src/session_intercom/
-  server.py   — FastMCP server, 10 tool definitions
-  db.py       — SQLite schema, queries, inbox bridge calls
+  server.py   — low-level MCP server: tool handlers + channel tailer task
+  db/         — SQLite layer (sessions / messages / channels / cleanup)
   models.py   — Session, Message, Channel dataclasses
-  inbox.py    — Native Claude Code inbox file writer
 ```
 
 - **Database**: `~/.local/share/session-intercom/intercom.db` (SQLite, WAL mode)
-- **Inbox files**: `~/.claude/teams/{team}/inboxes/team-lead.json`
-- **Transport**: MCP stdio (each Claude session runs its own server process, all share the DB)
+- **Transport**: MCP stdio. Inbound delivery via `notifications/claude/channel`
+- **Capability declared**: `experimental: {"claude/channel": {}}` in the MCP `initialize` response — this is what makes Claude Code register a notification listener
 
 ## Running tests
 
@@ -151,51 +144,23 @@ src/session_intercom/
 uv run --extra dev pytest tests/ -v
 ```
 
-## Native delivery troubleshooting
+## Migration from 0.5.x (file-inbox era)
 
-The CLI's `InboxPoller` binds to a team's `leadSessionId` at conversation startup. If your conversation started **before** `TeamCreate` ran (or before this team config existed for your session), native delivery may silently not fire — `intercom_register` will still report `inbox_file_ready: true` because the file is set up, but messages won't make it into your conversation between turns.
+Before 0.6, session-intercom wrote to `~/.claude/teams/<name>/inboxes/team-lead.json` and relied on the CLI's `InboxPoller` to pick it up. That path required `TeamCreate`, was vulnerable to stale `leadSessionId` bindings, and exposed `delivery_health` / `inbox_file_ready` / recovery recipes to work around the binding bug class.
 
-Symptoms: messages from other sessions don't appear automatically; you only see them by calling `intercom_history` or `intercom_poll`.
+All of that is gone in 0.6:
 
-Diagnose:
+- No more `team_name` argument on `intercom_register`
+- No more `inbox.py` / file inbox / `TeamCreate` setup
+- No more `intercom_diagnose` (its purpose was diagnosing file-inbox brokenness)
+- No more `delivery_health`, `inbox_file_ready`, `next_step`, `recovery`, `binding_mismatch` response fields
+- No more session-restart-or-not debate
 
-```
-intercom_diagnose("your-session-name")
-```
-
-Verdict will be one of:
-- `ok` — file inbox is empty/read, delivery is plausibly working (have someone DM you to confirm)
-- `delivery_likely_broken` — file inbox has unread messages that never made it in-band; the in-process poller binding is stale
-- `no_team_config` — `TeamCreate` was never called for this name
-- `no_team` — session was registered without a `team_name`
-
-Note: as of 0.5.0, `intercom_register` itself catches the empty-inbox case too — it compares `CLAUDE_CODE_SESSION_ID` (set in the MCP child's env by Claude Code) to the team's `leadSessionId` on disk. When they differ, the response returns `delivery_health: likely_broken` with a `binding_mismatch` field even when no messages have arrived yet, so fresh-setup failures surface at setup time instead of after the first missed inbound.
-
-If broken, recover **without restarting Claude**:
-
-1. `TeamDelete()` in the broken session (no args; operates on the current team). Clears the in-process binding and wipes `~/.claude/teams/<name>/`.
-2. `TeamCreate(team_name=<name>)` — fresh config with current session ID as lead.
-3. `intercom_register(name=<name>, team_name=<name>)` — idempotent reclaim, no DM history lost.
-4. (optional) `/mcp` to reconnect MCP servers if the MCP code itself was updated.
-
-`TeamDelete` is what makes this work without a Claude restart — it clears the in-process team context binding, so the next `TeamCreate` rebinds the InboxPoller correctly. A plain re-run of `TeamCreate` errors with "Already leading team..." — it won't update the binding by itself.
-
-Until you can run the recipe, fall back to `intercom_poll` for explicit drains.
-
-## Without native inbox (legacy mode)
-
-Sessions that don't set `team_name` in `intercom_register` still work — they just need to poll manually:
-
-```
-intercom_register("my-session")
-# Then periodically:
-intercom_poll("my-session")
-```
-
-This was the original mode before the inbox bridge. It works but burns context tokens on polling.
+The Channels API gives us delivery semantics with the right invariant: the notification goes out on *this* session's MCP stdio, so it can't be misrouted by a stale binding.
 
 ## Requirements
 
 - Python >= 3.11
-- Claude Code with `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`
+- Claude Code v2.1.80 or later (channels support)
+- Channels enabled per session: `claude --dangerously-load-development-channels server:session-intercom` until Anthropic allowlists this plugin
 - uv (for running)

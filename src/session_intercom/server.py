@@ -1,41 +1,48 @@
+"""session-intercom MCP server, channels-API edition.
+
+Uses the low-level `mcp.server.Server` so we can declare the experimental
+`claude/channel` capability and push `notifications/claude/channel` events
+directly into the host Claude Code session. The previous file-inbox bridge
+(write to `~/.claude/teams/<name>/inboxes/team-lead.json` and let the CLI's
+InboxPoller pick it up) is gone — Claude Code receives DMs and channel
+broadcasts as `<channel>` tags between turns over the MCP transport itself.
+
+Architecture:
+  - Each Claude Code session spawns its own stdio MCP subprocess
+  - This module sets up tool handlers (register, send, broadcast, ...)
+  - After register, a background tailer polls SQLite for messages addressed
+    to the registered session and emits channel notifications on the same
+    write stream Claude Code is listening on
+"""
+
 from __future__ import annotations
 
 import json
 import logging
-import os
-from contextlib import asynccontextmanager
 from dataclasses import asdict
+from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+import anyio
+import mcp.types as types
+from mcp.server.lowlevel import NotificationOptions, Server
+from mcp.server.models import InitializationOptions
+from mcp.server.stdio import stdio_server
+from mcp.shared.message import SessionMessage
+from mcp.types import JSONRPCMessage, JSONRPCNotification
 
 from . import db
 
+__version__ = "0.6.0"
+
 logger = logging.getLogger("session-intercom")
 
-# Per-process state: each Claude session has its own MCP subprocess, so a
-# module-level "current session" is exactly the right scope. After register,
-# all other tools default to this name unless an explicit from_name overrides.
+# Per-process state: each Claude Code session has its own MCP subprocess.
 _current_session: str | None = None
-
-
-@asynccontextmanager
-async def lifespan(server: FastMCP):
-    await db.init_db()
-    logger.info("session-intercom: DB initialized at %s", db.DB_PATH)
-    yield {}
-
-
-mcp = FastMCP("session-intercom", lifespan=lifespan)
-
-
-def _json(obj) -> str:
-    if hasattr(obj, "__dataclass_fields__"):
-        return json.dumps(asdict(obj), indent=2)
-    return json.dumps(obj, indent=2, default=str)
+# Set once on register; the tailer waits on this before polling.
+_tailer_ready = anyio.Event()
 
 
 def _resolve_name(provided: str | None) -> str:
-    """Return the explicit name if given, otherwise the registered session name."""
     if provided:
         return provided
     if _current_session:
@@ -46,374 +53,327 @@ def _resolve_name(provided: str | None) -> str:
     )
 
 
-# --- Tools ---
+def _ok(data: dict[str, Any]) -> list[types.TextContent]:
+    return [types.TextContent(type="text", text=json.dumps(data, indent=2, default=str))]
 
 
-@mcp.tool()
-async def intercom_register(
-    name: str, team_name: str | None = None, metadata: str | None = None
-) -> str:
-    """Register this session with the intercom system.
+def _err(msg: str) -> list[types.TextContent]:
+    return [types.TextContent(type="text", text=json.dumps({"error": msg}))]
 
-    After registering, all other intercom tools default to this name — you
-    don't need to pass it on every call. Pass team_name (typically the same
-    as name) to enable zero-polling native inbox delivery.
 
-    Setup (one-time per session):
-      1. Call TeamCreate(team_name=<name>)
-      2. Call intercom_register(name=<name>, team_name=<name>)
+# --- Build the server ---
 
-    Args:
-        name: Your session name (alphanumeric/hyphens, 1-64 chars). E.g. "rom-hacker".
-        team_name: Claude Code team name for native delivery. Usually same as name.
-        metadata: Optional free-form string with session info.
-    """
+server: Server = Server("session-intercom")
+
+
+@server.list_tools()
+async def list_tools() -> list[types.Tool]:
+    return [
+        types.Tool(
+            name="intercom_register",
+            description=(
+                "Register this session with the intercom network. After registering, "
+                "all other intercom tools default to this name. Inbound messages arrive "
+                'between turns as <channel source="session-intercom" ...> tags via MCP '
+                "push — no polling, no file inbox."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Your session name (alphanumeric/hyphens, 1-64 chars).",
+                    },
+                    "metadata": {"type": ["string", "null"]},
+                },
+                "required": ["name"],
+            },
+        ),
+        types.Tool(
+            name="intercom_send",
+            description=(
+                "Send a direct message. Recipient sees it as a <channel> tag on their "
+                "next turn. from_name defaults to your registered name."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "to_name": {"type": "string"},
+                    "body": {"type": "string"},
+                    "thread_id": {"type": ["integer", "null"]},
+                    "from_name": {"type": ["string", "null"]},
+                },
+                "required": ["to_name", "body"],
+            },
+        ),
+        types.Tool(
+            name="intercom_broadcast",
+            description="Broadcast to a channel (default: 'general'). from_name defaults to your registered session.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "body": {"type": "string"},
+                    "channel": {"type": "string", "default": "general"},
+                    "thread_id": {"type": ["integer", "null"]},
+                    "from_name": {"type": ["string", "null"]},
+                },
+                "required": ["body"],
+            },
+        ),
+        types.Tool(
+            name="intercom_list_sessions",
+            description="List all registered sessions.",
+            inputSchema={
+                "type": "object",
+                "properties": {"include_stale": {"type": "boolean", "default": False}},
+            },
+        ),
+        types.Tool(
+            name="intercom_history",
+            description="Retrieve message history (read-only — does not advance cursors).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "with_session": {"type": ["string", "null"]},
+                    "channel": {"type": ["string", "null"]},
+                    "thread_id": {"type": ["integer", "null"]},
+                    "limit": {"type": "integer", "default": 50},
+                    "before_id": {"type": ["integer", "null"]},
+                    "name": {"type": ["string", "null"]},
+                },
+            },
+        ),
+        types.Tool(
+            name="intercom_poll",
+            description=(
+                "Explicit drain. With channels delivery active you rarely need this — "
+                "messages arrive between turns. Useful for manual drains or recovery."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name": {"type": ["string", "null"]},
+                    "mark_read": {"type": "boolean", "default": True},
+                    "limit": {"type": "integer", "default": 50},
+                    "channel": {"type": ["string", "null"]},
+                },
+            },
+        ),
+        types.Tool(
+            name="intercom_list_channels",
+            description="List available broadcast channels.",
+            inputSchema={"type": "object", "properties": {}},
+        ),
+        types.Tool(
+            name="intercom_create_channel",
+            description="Create a new broadcast channel.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "channel_name": {"type": "string"},
+                    "description": {"type": ["string", "null"]},
+                },
+                "required": ["channel_name"],
+            },
+        ),
+        types.Tool(
+            name="intercom_cleanup",
+            description="Remove sessions inactive for ttl_minutes (default: 2 weeks).",
+            inputSchema={
+                "type": "object",
+                "properties": {"ttl_minutes": {"type": "integer", "default": db.CLEANUP_MINUTES}},
+            },
+        ),
+    ]
+
+
+@server.call_tool()
+async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextContent]:
     global _current_session
     try:
-        session = await db.register_session(name, metadata, team_name)
-        _current_session = name
-        result: dict = {"status": "registered", "session": asdict(session)}
-        if team_name:
-            from .inbox import ensure_inbox, inbox_stats
+        if name == "intercom_register":
+            session = await db.register_session(arguments["name"], arguments.get("metadata"), None)
+            _current_session = arguments["name"]
+            if not _tailer_ready.is_set():
+                _tailer_ready.set()
+            return _ok({"status": "registered", "session": asdict(session)})
 
-            result["inbox_file_ready"] = ensure_inbox(team_name)
-            if not result["inbox_file_ready"]:
-                result["delivery_health"] = "no_inbox"
-                result["next_step"] = (
-                    f"Call TeamCreate(team_name='{team_name}') now to enable "
-                    f"native zero-polling delivery, then re-call intercom_register. "
-                    f"Registration is idempotent."
-                )
-            else:
-                stats = inbox_stats(team_name)
-                unread = stats["unread_messages"] if stats else 0
-                lead_sid = stats.get("lead_session_id") if stats else None
-                current_sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
-                # Stale-binding by leadSessionId: the InboxPoller is bound to
-                # whichever conversation's session ID is the team's lead. If
-                # this MCP child's parent session differs, inbound delivery
-                # will silently drop even when the inbox is empty.
-                binding_mismatch = bool(current_sid and lead_sid and current_sid != lead_sid)
-                if binding_mismatch or unread > 0:
-                    result["delivery_health"] = "likely_broken"
-                    if unread > 0:
-                        result["unread_in_file_inbox"] = unread
-                    if binding_mismatch:
-                        result["binding_mismatch"] = {
-                            "team_lead_session_id": lead_sid,
-                            "this_session_id": current_sid,
-                        }
-                    cause = (
-                        f"team config's leadSessionId ({lead_sid}) does not "
-                        f"match this conversation's session ID ({current_sid}) "
-                        f"— InboxPoller is bound to a different session"
-                        if binding_mismatch
-                        else f"file inbox has {unread} unread message(s) that "
-                        f"never got delivered (leadSessionId likely stale)"
-                    )
-                    result["recovery"] = (
-                        f"Native delivery is likely broken — {cause}.\n"
-                        f"\nRecovery (no Claude restart needed):\n"
-                        f"  1. TeamDelete()\n"
-                        f"  2. TeamCreate(team_name='{team_name}')\n"
-                        f"  3. intercom_register(name='{name}', team_name='{team_name}')\n"
-                        f"\nUntil then, drain via intercom_poll() — outbound "
-                        f"sends already work; only inbound auto-delivery is broken."
-                    )
-                else:
-                    result["delivery_health"] = "likely_ok"
-        else:
-            result["delivery_health"] = "polling_only"
-            result["tip"] = (
-                "For zero-polling delivery: call TeamCreate(team_name=<name>), "
-                "then re-register with team_name set. Or use the "
-                "/session-intercom:intercom slash command."
+        if name == "intercom_send":
+            sender = _resolve_name(arguments.get("from_name"))
+            msg = await db.send_message(
+                sender, arguments["to_name"], arguments["body"], arguments.get("thread_id")
             )
-        return _json(result)
+            return _ok(
+                {
+                    "status": "sent",
+                    "message_id": msg.id,
+                    "from": sender,
+                    "to": arguments["to_name"],
+                    "created_at": msg.created_at,
+                }
+            )
+
+        if name == "intercom_broadcast":
+            sender = _resolve_name(arguments.get("from_name"))
+            channel = arguments.get("channel", "general")
+            msg = await db.broadcast_message(
+                sender, arguments["body"], channel, arguments.get("thread_id")
+            )
+            return _ok(
+                {
+                    "status": "broadcast",
+                    "message_id": msg.id,
+                    "from": sender,
+                    "channel": channel,
+                    "created_at": msg.created_at,
+                }
+            )
+
+        if name == "intercom_list_sessions":
+            sessions = await db.list_sessions(arguments.get("include_stale", False))
+            return _ok({"sessions": [asdict(s) for s in sessions], "count": len(sessions)})
+
+        if name == "intercom_history":
+            session_name = _resolve_name(arguments.get("name"))
+            messages = await db.get_history(
+                session_name,
+                arguments.get("with_session"),
+                arguments.get("channel"),
+                arguments.get("thread_id"),
+                arguments.get("limit", 50),
+                arguments.get("before_id"),
+            )
+            return _ok({"messages": [asdict(m) for m in messages], "count": len(messages)})
+
+        if name == "intercom_poll":
+            session_name = _resolve_name(arguments.get("name"))
+            messages, remaining = await db.poll_messages(
+                session_name,
+                arguments.get("mark_read", True),
+                arguments.get("limit", 50),
+                arguments.get("channel"),
+            )
+            return _ok(
+                {
+                    "messages": [asdict(m) for m in messages],
+                    "count": len(messages),
+                    "remaining": remaining,
+                }
+            )
+
+        if name == "intercom_list_channels":
+            channels = await db.list_channels()
+            return _ok({"channels": [asdict(c) for c in channels], "count": len(channels)})
+
+        if name == "intercom_create_channel":
+            channel = await db.create_channel(
+                arguments["channel_name"], arguments.get("description")
+            )
+            return _ok({"status": "created", "channel": asdict(channel)})
+
+        if name == "intercom_cleanup":
+            ttl = arguments.get("ttl_minutes", db.CLEANUP_MINUTES)
+            removed = await db.cleanup_sessions(ttl)
+            return _ok(
+                {"status": "cleaned", "removed": removed, "count": len(removed), "ttl_minutes": ttl}
+            )
+
+        return _err(f"Unknown tool: {name}")
+
     except ValueError as e:
-        return _json({"error": str(e)})
+        return _err(str(e))
 
 
-@mcp.tool()
-async def intercom_send(
-    to_name: str,
-    body: str,
-    thread_id: int | None = None,
-    from_name: str | None = None,
-) -> str:
-    """Send a direct message to another session.
+# --- Tailer: push new messages as channel notifications ---
 
-    Defaults `from_name` to the currently registered session — you don't
-    need to pass it unless you want to send as a different identity.
 
-    Args:
-        to_name: Recipient session name.
-        body: Message content (max 32KB).
-        thread_id: Optional message ID to reply to (creates a thread).
-        from_name: Sender override. Defaults to the registered session.
+async def _emit_channel(write_stream: Any, content: str, meta: dict[str, str]) -> None:
+    """Write a raw notifications/claude/channel notification to the MCP stream.
+
+    Bypasses the typed SendNotificationT path because the SDK doesn't ship a
+    typed model for this Claude-specific method. The wire format is standard
+    JSON-RPC 2.0; we hand-construct JSONRPCNotification and push it on the
+    same stream Claude Code is reading on.
     """
-    try:
-        sender = _resolve_name(from_name)
-        msg = await db.send_message(sender, to_name, body, thread_id)
-        return _json(
-            {
-                "status": "sent",
-                "message_id": msg.id,
-                "from": sender,
-                "to": to_name,
-                "created_at": msg.created_at,
-            }
-        )
-    except ValueError as e:
-        return _json({"error": str(e)})
-
-
-@mcp.tool()
-async def intercom_broadcast(
-    body: str,
-    channel: str = "general",
-    thread_id: int | None = None,
-    from_name: str | None = None,
-) -> str:
-    """Broadcast a message to a channel (all sessions on the channel see it).
-
-    Defaults `from_name` to the currently registered session.
-
-    Args:
-        body: Message content (max 32KB).
-        channel: Channel name (default: "general").
-        thread_id: Optional message ID to reply to (creates a thread).
-        from_name: Sender override. Defaults to the registered session.
-    """
-    try:
-        sender = _resolve_name(from_name)
-        msg = await db.broadcast_message(sender, body, channel, thread_id)
-        return _json(
-            {
-                "status": "broadcast",
-                "message_id": msg.id,
-                "from": sender,
-                "channel": channel,
-                "created_at": msg.created_at,
-            }
-        )
-    except ValueError as e:
-        return _json({"error": str(e)})
-
-
-@mcp.tool()
-async def intercom_poll(
-    name: str | None = None,
-    mark_read: bool = True,
-    limit: int = 50,
-    channel: str | None = None,
-) -> str:
-    """Poll for new/unread messages. Updates your heartbeat.
-
-    With native inbox delivery active, you don't need to call this — messages
-    arrive automatically between turns. Use it for explicit drains or as a
-    workaround when intercom_diagnose reports broken delivery.
-
-    Args:
-        name: Session name override. Defaults to the registered session.
-        mark_read: Advance read cursors so these messages won't appear again (default: true).
-        limit: Max messages (1-200, default: 50).
-        channel: Filter to a specific channel. Omit to get DMs + all channels.
-    """
-    try:
-        session_name = _resolve_name(name)
-        messages, remaining = await db.poll_messages(session_name, mark_read, limit, channel)
-        return _json(
-            {
-                "messages": [asdict(m) for m in messages],
-                "count": len(messages),
-                "remaining": remaining,
-            }
-        )
-    except ValueError as e:
-        return _json({"error": str(e)})
-
-
-@mcp.tool()
-async def intercom_list_sessions(include_stale: bool = False) -> str:
-    """List all registered sessions.
-
-    Args:
-        include_stale: Include sessions with no recent heartbeat (default: false).
-    """
-    sessions = await db.list_sessions(include_stale)
-    return _json(
-        {
-            "sessions": [asdict(s) for s in sessions],
-            "count": len(sessions),
-        }
+    notification = JSONRPCNotification(
+        jsonrpc="2.0",
+        method="notifications/claude/channel",
+        params={"content": content, "meta": meta},
     )
+    await write_stream.send(SessionMessage(message=JSONRPCMessage(notification)))
 
 
-@mcp.tool()
-async def intercom_history(
-    with_session: str | None = None,
-    channel: str | None = None,
-    thread_id: int | None = None,
-    limit: int = 50,
-    before_id: int | None = None,
-    name: str | None = None,
-) -> str:
-    """Retrieve message history (read-only — does not advance cursors).
-
-    Useful for inspecting messages without consuming them. Defaults to your
-    registered session.
-
-    Args:
-        with_session: Filter to DM conversation with this session.
-        channel: Filter to messages in this channel.
-        thread_id: Get all messages in a specific thread.
-        limit: Max messages (1-200, default: 50).
-        before_id: Pagination cursor — get messages before this ID.
-        name: Session name override. Defaults to the registered session.
+def _meta_safe(d: dict[str, Any]) -> dict[str, str]:
+    """Channels API requires meta keys to be identifiers (letters/digits/_)
+    and values to be strings. Drop anything else, stringify the rest.
     """
-    try:
-        session_name = _resolve_name(name)
-        messages = await db.get_history(
-            session_name, with_session, channel, thread_id, limit, before_id
-        )
-        return _json(
-            {
-                "messages": [asdict(m) for m in messages],
-                "count": len(messages),
-            }
-        )
-    except ValueError as e:
-        return _json({"error": str(e)})
+    out: dict[str, str] = {}
+    for k, v in d.items():
+        if v is None:
+            continue
+        if not isinstance(k, str) or not k.replace("_", "").isalnum():
+            continue
+        out[k] = str(v)
+    return out
 
 
-@mcp.tool()
-async def intercom_list_channels() -> str:
-    """List all available channels."""
-    channels = await db.list_channels()
-    return _json(
-        {
-            "channels": [asdict(c) for c in channels],
-            "count": len(channels),
-        }
-    )
-
-
-@mcp.tool()
-async def intercom_create_channel(channel_name: str, description: str | None = None) -> str:
-    """Create a new channel for broadcast messages.
-
-    Args:
-        channel_name: Channel name (alphanumeric/hyphens, 1-64 chars).
-        description: Optional channel description.
+async def _tailer_loop(write_stream: Any) -> None:
+    """Background task: poll for new messages addressed to _current_session,
+    emit each as a `<channel>` tag, advance the cursor so they aren't redelivered.
     """
-    try:
-        channel = await db.create_channel(channel_name, description)
-        return _json({"status": "created", "channel": asdict(channel)})
-    except (ValueError, Exception) as e:
-        return _json({"error": str(e)})
+    await _tailer_ready.wait()
+    logger.info("channel tailer started for session %s", _current_session)
+
+    while True:
+        try:
+            if _current_session is None:
+                await anyio.sleep(1.0)
+                continue
+
+            messages, _ = await db.poll_messages(
+                _current_session, mark_read=True, limit=20, channel=None
+            )
+            for msg in messages:
+                meta = _meta_safe(
+                    {
+                        "from": msg.sender_name,
+                        "message_id": msg.id,
+                        "channel": msg.channel,
+                        "thread_id": msg.thread_id,
+                    }
+                )
+                await _emit_channel(write_stream, msg.body, meta)
+                logger.debug("emitted channel notification for msg %d", msg.id)
+        except Exception:
+            logger.exception("tailer iteration failed; continuing")
+
+        await anyio.sleep(1.0)
 
 
-@mcp.tool()
-async def intercom_diagnose(name: str | None = None) -> str:
-    """Diagnose native-inbox delivery health.
+# --- Main entry point ---
 
-    Checks team config, file inbox state, and MCP-side cursors to detect when
-    the CLI's InboxPoller isn't actually delivering messages.
 
-    Args:
-        name: Session name override. Defaults to the registered session.
-    """
-    try:
-        session_name = _resolve_name(name)
-        diag = await db.diagnose_session(session_name)
-    except ValueError as e:
-        return _json({"error": str(e)})
+async def _run() -> None:
+    await db.init_db()
+    logger.info("session-intercom v%s — DB at %s", __version__, db.DB_PATH)
 
-    session = diag["session"]
-    team_name = session.get("team_name")
-    result: dict = {
-        "session_name": session["name"],
-        "team_name": team_name,
-        "last_heartbeat": session["last_heartbeat"],
-        "mcp_unread_dms": diag["mcp_unread_dms"],
-        "mcp_unread_channel_msgs": diag["mcp_unread_channel_msgs"],
-        "latest_addressed_message": diag["latest_addressed_message"],
-    }
-
-    if not team_name:
-        result["verdict"] = "no_team"
-        result["explanation"] = (
-            "This session has no team_name set. Native inbox delivery is "
-            "disabled. Re-register with a team_name (after TeamCreate), or "
-            "rely on manual intercom_poll."
+    async with stdio_server() as (read_stream, write_stream):
+        init_options = InitializationOptions(
+            server_name="session-intercom",
+            server_version=__version__,
+            capabilities=server.get_capabilities(
+                notification_options=NotificationOptions(),
+                experimental_capabilities={"claude/channel": {}},
+            ),
         )
-        return _json(result)
-
-    from .inbox import inbox_stats
-
-    stats = inbox_stats(team_name)
-    result["inbox_stats"] = stats
-
-    if stats is None:
-        result["verdict"] = "no_team_config"
-        result["explanation"] = (
-            f"~/.claude/teams/{team_name}/config.json does not exist. "
-            f"Call TeamCreate(team_name='{team_name}') to create it."
-        )
-    elif stats["unread_messages"] > 0:
-        result["verdict"] = "delivery_likely_broken"
-        result["explanation"] = (
-            f"File inbox has {stats['unread_messages']} unread message(s) that "
-            f"haven't been delivered to your conversation. The CLI's "
-            f"InboxPoller likely isn't bound to this session — common cause: "
-            f"leadSessionId mismatch.\n\nFix without restarting Claude:\n"
-            f"  1. TeamDelete()  — clears the in-process binding\n"
-            f"  2. TeamCreate(team_name='{team_name}')\n"
-            f"  3. intercom_register(name='{session['name']}', team_name='{team_name}')\n"
-            f"\nUntil then, drain via intercom_poll() (no args needed)."
-        )
-    elif diag["latest_addressed_message"] is None:
-        result["verdict"] = "no_messages_yet"
-        result["explanation"] = (
-            "No messages have been addressed to this session yet. Have someone "
-            "send a test DM to verify delivery."
-        )
-    else:
-        result["verdict"] = "ok"
-        result["explanation"] = (
-            "File inbox is empty (or fully read) and config exists. Native "
-            "delivery is plausibly working. To confirm, have a sender send a "
-            "fresh DM and re-run intercom_diagnose — if a new DM lands in the "
-            "file inbox and stays unread, delivery is broken."
-        )
-    return _json(result)
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(_tailer_loop, write_stream)
+            await server.run(read_stream, write_stream, init_options)
+            tg.cancel_scope.cancel()
 
 
-@mcp.tool()
-async def intercom_cleanup(ttl_minutes: int = db.CLEANUP_MINUTES) -> str:
-    """Remove stale sessions (no heartbeat within TTL).
-
-    Default TTL matches the durability promise (2 weeks). Pass a smaller value
-    to force an aggressive sweep, but be aware this will delete other agents'
-    sessions if they haven't checked in within that window.
-
-    Args:
-        ttl_minutes: Minutes of inactivity before a session is considered stale.
-    """
-    removed = await db.cleanup_sessions(ttl_minutes)
-    return _json(
-        {
-            "status": "cleaned",
-            "removed": removed,
-            "count": len(removed),
-            "ttl_minutes": ttl_minutes,
-        }
-    )
-
-
-def main():
-    mcp.run()
+def main() -> None:
+    anyio.run(_run)
 
 
 if __name__ == "__main__":
