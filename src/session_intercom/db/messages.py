@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import aiosqlite
 
-from ..inbox import write_to_inbox
 from ..models import Message
 from ._common import _now, get_connection, validate_body
 from .sessions import get_session_by_name
@@ -39,15 +38,6 @@ async def send_message(
 
         row = await db.execute_fetchall("SELECT created_at FROM messages WHERE id = ?", (msg_id,))
         created_at = row[0]["created_at"] if row else _now()
-
-        # Bridge to native inbox if recipient has a team
-        if recipient.get("team_name"):
-            write_to_inbox(
-                recipient["team_name"],
-                from_name,
-                body,
-                summary=f"intercom DM from {from_name}",
-            )
 
         return Message(
             id=msg_id,
@@ -98,19 +88,6 @@ async def broadcast_message(
 
         row = await db.execute_fetchall("SELECT created_at FROM messages WHERE id = ?", (msg_id,))
         created_at = row[0]["created_at"] if row else _now()
-
-        # Bridge broadcast to native inboxes for all sessions with teams (except sender)
-        team_rows = await db.execute_fetchall(
-            "SELECT team_name FROM sessions WHERE team_name IS NOT NULL AND id != ?",
-            (sender["id"],),
-        )
-        for tr in team_rows:
-            write_to_inbox(
-                tr["team_name"],
-                from_name,
-                body,
-                summary=f"[{channel}] {from_name}",
-            )
 
         return Message(
             id=msg_id,
