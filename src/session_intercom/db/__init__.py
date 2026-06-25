@@ -32,6 +32,7 @@ from .channels import create_channel, list_channels
 from .cleanup import cleanup_sessions
 from .messages import (
     broadcast_message,
+    fetch_for_channel_tailer,
     get_history,
     poll_messages,
     send_message,
@@ -89,6 +90,7 @@ __all__ = [
     "broadcast_message",
     "poll_messages",
     "get_history",
+    "fetch_for_channel_tailer",
     # channels
     "list_channels",
     "create_channel",

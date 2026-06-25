@@ -277,3 +277,87 @@ async def test_register_idempotent_preserves_messages():
     # Messages should still be intact
     history = await db.get_history("alice", with_session="bob")
     assert len(history) == 2
+
+
+# --- Channel-tailer cursor split (0.6.1 regression guard) ---
+
+
+@pytest.mark.asyncio
+async def test_tailer_cursor_independent_from_poll_cursor():
+    """fetch_for_channel_tailer must NOT advance the per-sender cursor that
+    poll_messages uses. If channel delivery silently fails, poll must still
+    work as a recovery path."""
+    await db.init_db()
+    await db.register_session("alice")
+    await db.register_session("bob")
+    await db.send_message("alice", "bob", "hello via channel + poll")
+
+    # Tailer drains its own cursor — simulating "tailer emitted, channel
+    # notification may or may not have actually landed in Claude's context".
+    tailed = await db.fetch_for_channel_tailer("bob")
+    assert len(tailed) == 1
+    assert tailed[0].body == "hello via channel + poll"
+
+    # Tailer cursor is now past msg 1, but the per-sender cursor used by
+    # intercom_poll is untouched. So poll still finds the message.
+    polled, _ = await db.poll_messages("bob")
+    assert len(polled) == 1, (
+        "poll must still see the message — its cursor was not advanced by the tailer"
+    )
+    assert polled[0].body == "hello via channel + poll"
+
+    # After explicit poll(mark_read=True), poll is drained.
+    polled2, _ = await db.poll_messages("bob")
+    assert polled2 == []
+
+    # Tailer is ALSO not seeing it again — its cursor was advanced during the
+    # tailer fetch above.
+    tailed2 = await db.fetch_for_channel_tailer("bob")
+    assert tailed2 == []
+
+
+@pytest.mark.asyncio
+async def test_tailer_cursor_advances_monotonically():
+    """Successive fetch_for_channel_tailer calls must not redeliver messages."""
+    await db.init_db()
+    await db.register_session("alice")
+    await db.register_session("bob")
+    await db.send_message("alice", "bob", "m1")
+    await db.send_message("alice", "bob", "m2")
+
+    first = await db.fetch_for_channel_tailer("bob")
+    assert [m.body for m in first] == ["m1", "m2"]
+
+    # Nothing new — cursor sits at m2's id.
+    second = await db.fetch_for_channel_tailer("bob")
+    assert second == []
+
+    # New send → tailer picks it up, others already delivered are not.
+    await db.send_message("alice", "bob", "m3")
+    third = await db.fetch_for_channel_tailer("bob")
+    assert [m.body for m in third] == ["m3"]
+
+
+@pytest.mark.asyncio
+async def test_tailer_picks_up_channel_broadcasts():
+    """Broadcasts (to channels, not DMs) should also flow through the tailer."""
+    await db.init_db()
+    await db.register_session("alice")
+    await db.register_session("bob")
+    await db.broadcast_message("alice", "general announcement", "general")
+
+    tailed = await db.fetch_for_channel_tailer("bob")
+    assert len(tailed) == 1
+    assert tailed[0].body == "general announcement"
+    assert tailed[0].channel == "general"
+
+
+@pytest.mark.asyncio
+async def test_tailer_does_not_pick_up_own_broadcasts():
+    """A session shouldn't see its own broadcast echoed back via the tailer."""
+    await db.init_db()
+    await db.register_session("alice")
+    await db.broadcast_message("alice", "my own message", "general")
+
+    tailed = await db.fetch_for_channel_tailer("alice")
+    assert tailed == []

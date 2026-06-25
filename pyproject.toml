@@ -1,6 +1,6 @@
 [project]
 name = "session-intercom"
-version = "0.6.0"
+version = "0.6.1"
 description = "MCP server for inter-session communication between Claude Code sessions"
 requires-python = ">=3.11"
 dependencies = [

@@ -32,7 +32,7 @@ from mcp.types import JSONRPCMessage, JSONRPCNotification
 
 from . import db
 
-__version__ = "0.6.0"
+__version__ = "0.6.1"
 
 logger = logging.getLogger("session-intercom")
 
@@ -146,8 +146,11 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="intercom_poll",
             description=(
-                "Explicit drain. With channels delivery active you rarely need this — "
-                "messages arrive between turns. Useful for manual drains or recovery."
+                "Drain unread messages using the per-sender / per-channel cursors. "
+                "Independent from channel-notification delivery: if the host wasn't "
+                "launched with `--dangerously-load-development-channels server:session-intercom` "
+                "(or channels otherwise silently fail), this is the recovery path — the "
+                "tailer's cursor is separate and won't have advanced these cursors."
             ),
             inputSchema={
                 "type": "object",
@@ -318,8 +321,14 @@ def _meta_safe(d: dict[str, Any]) -> dict[str, str]:
 
 
 async def _tailer_loop(write_stream: Any) -> None:
-    """Background task: poll for new messages addressed to _current_session,
-    emit each as a `<channel>` tag, advance the cursor so they aren't redelivered.
+    """Background task: fetch new messages addressed to _current_session via a
+    tailer-specific cursor, emit each as a `<channel>` tag.
+
+    Critically: this uses `db.fetch_for_channel_tailer`, which advances a
+    cursor under source `tailer:channel` — independent from the per-sender
+    cursors that `intercom_poll` advances. If channel delivery silently fails
+    (no host listener), `intercom_poll` still works as a recovery path
+    because its cursors are untouched.
     """
     await _tailer_ready.wait()
     logger.info("channel tailer started for session %s", _current_session)
@@ -330,9 +339,7 @@ async def _tailer_loop(write_stream: Any) -> None:
                 await anyio.sleep(1.0)
                 continue
 
-            messages, _ = await db.poll_messages(
-                _current_session, mark_read=True, limit=20, channel=None
-            )
+            messages = await db.fetch_for_channel_tailer(_current_session, limit=20)
             for msg in messages:
                 meta = _meta_safe(
                     {

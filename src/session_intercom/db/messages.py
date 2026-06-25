@@ -138,6 +138,62 @@ async def poll_messages(
         await db.close()
 
 
+_TAILER_CURSOR_SOURCE = "tailer:channel"
+
+
+async def fetch_for_channel_tailer(name: str, limit: int = 20) -> list[Message]:
+    """Read new messages for the tailer to emit as channel notifications.
+
+    Uses a tailer-specific cursor (`tailer:channel`) that is independent
+    from the per-sender / per-channel cursors `poll_messages` advances. This
+    means: tailer emission and explicit poll consumption are decoupled. If
+    a notification silently fails to land (no host listener), the message is
+    still consumable via `intercom_poll` because its per-sender cursor was
+    never touched.
+
+    Advances the tailer cursor atomically with the read so a message isn't
+    re-emitted on the next tick.
+    """
+    limit = min(max(limit, 1), 200)
+    db = await get_connection()
+    try:
+        session = await get_session_by_name(db, name)
+        session_id = session["id"]
+
+        rows = await db.execute_fetchall(
+            """
+            SELECT m.*, s.name AS sender_name
+            FROM messages m
+            JOIN sessions s ON s.id = m.sender_id
+            WHERE (m.recipient_id = ? OR (m.channel IS NOT NULL AND m.sender_id != ?))
+              AND m.id > COALESCE(
+                (SELECT last_read_id FROM read_cursors
+                 WHERE session_id = ? AND source = ?), 0
+              )
+            ORDER BY m.id
+            LIMIT ?
+            """,
+            (session_id, session_id, session_id, _TAILER_CURSOR_SOURCE, limit),
+        )
+        messages = [_row_to_message(r) for r in rows]
+
+        if messages:
+            max_id = max(m.id for m in messages)
+            await db.execute(
+                """
+                INSERT INTO read_cursors (session_id, source, last_read_id)
+                VALUES (?, ?, ?)
+                ON CONFLICT (session_id, source)
+                DO UPDATE SET last_read_id = MAX(read_cursors.last_read_id, excluded.last_read_id)
+                """,
+                (session_id, _TAILER_CURSOR_SOURCE, max_id),
+            )
+            await db.commit()
+        return messages
+    finally:
+        await db.close()
+
+
 async def _poll_dms(db: aiosqlite.Connection, session_id: str, limit: int) -> list[Message]:
     rows = await db.execute_fetchall(
         """
