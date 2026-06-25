@@ -1,142 +1,296 @@
 # session-intercom
 
-MCP server for P2P communication between independent Claude Code sessions. Messages arrive as `<channel>` tags between turns over the native MCP transport — zero polling, no file inbox, no `leadSessionId` binding to break.
+P2P messaging between independent Claude Code sessions over the [Channels API](https://code.claude.com/docs/en/channels-reference). Inbound messages arrive between turns as `<channel source="session-intercom" from="..." message_id="...">body</channel>` tags — no polling, no file inbox, no busy waiting.
 
-## The problem
+**Architecture in one sentence**: each Claude Code session spawns its own stdio MCP subprocess; subprocesses share state via a single SQLite file; a background tailer per subprocess pushes `notifications/claude/channel` events to its host between turns.
 
-Claude Code has no built-in way for independent sessions to talk to each other. Agent Teams only work within a single parent session. If you have 5 sessions working on different parts of a project, they can't coordinate.
+This README is written so another agent or human can lift the design without reading the source.
 
-session-intercom solves this with an MCP server that registers named sessions, routes DMs and broadcast channels through shared SQLite state, and pushes inbound messages into each session as **Claude Code channel notifications** (`notifications/claude/channel`). The recipient sees them as `<channel source="session-intercom" from="alice" ...>body</channel>` tags injected between turns, like teammate messages.
+---
 
-## Quick start
+## Why this is non-trivial
 
-### 1. Install
+The hard part is that MCP tools are pull-based by default: the model decides to call a thing, gets back a result. Inter-session messaging needs the opposite — a server has to wake an *idle* Claude session when an external event arrives. Claude Code's Channels API (shipped in v2.1.80, March 2026) is what makes this possible: a server declares the `claude/channel` experimental capability, then pushes `notifications/claude/channel` events on its stdio write stream. The CLI injects each as a `<channel>` tag at the start of the next turn — including waking idle sessions that aren't waiting on a user prompt.
 
-```bash
-git clone git@github.com:struktured-labs/session-intercom.git
-cd session-intercom
-uv sync
+Before this, our previous implementation wrote to `~/.claude/teams/<name>/inboxes/team-lead.json` and relied on the CLI's `InboxPoller`. That worked but coupled to a `leadSessionId` binding that broke easily and required `TeamCreate`/`TeamDelete` recovery dances. All gone in 0.6.
+
+---
+
+## The integration in 60 lines of code
+
+Five load-bearing pieces. Everything else is plumbing.
+
+### 1. Use the low-level `mcp.server.Server`, not `FastMCP`
+
+```python
+from mcp.server.lowlevel import Server, NotificationOptions
+from mcp.server.models import InitializationOptions
+
+server = Server("session-intercom")
 ```
 
-### 2. Configure MCP
+**Why**: `FastMCP` silently drops the `experimental` capability block. You will get zero errors and zero deliveries until you switch to the low-level class. We confirmed this both in the live spike and in the [GitHub thread that drove channels into the product](https://github.com/anthropics/claude-code/issues/33679#issuecomment-4104806674).
 
-Add to `~/.claude.json` (or `~/.claude/mcp.json`):
+### 2. Declare the capability
+
+```python
+init_options = InitializationOptions(
+    server_name="session-intercom",
+    server_version=__version__,
+    capabilities=server.get_capabilities(
+        notification_options=NotificationOptions(),
+        experimental_capabilities={"claude/channel": {}},
+    ),
+)
+```
+
+The `{"claude/channel": {}}` is exactly what tells Claude Code to arm a notification listener for this MCP subprocess. The empty `{}` is intentional — presence is the signal.
+
+### 3. Emit `notifications/claude/channel` as a raw JSON-RPC frame
+
+The SDK has no typed model for this Claude-specific method, so we hand-construct one and write directly to the same write stream `Server.run()` uses:
+
+```python
+from mcp.shared.message import SessionMessage
+from mcp.types import JSONRPCMessage, JSONRPCNotification
+
+async def emit_channel(write_stream, content: str, meta: dict[str, str]) -> None:
+    notification = JSONRPCNotification(
+        jsonrpc="2.0",
+        method="notifications/claude/channel",
+        params={"content": content, "meta": meta},
+    )
+    await write_stream.send(SessionMessage(message=JSONRPCMessage(notification)))
+```
+
+The on-wire payload is exactly:
 
 ```json
-{
-  "mcpServers": {
-    "session-intercom": {
-      "type": "stdio",
-      "command": "uv",
-      "args": ["run", "--directory", "/path/to/session-intercom", "session-intercom"]
-    }
-  }
-}
+{"method":"notifications/claude/channel","params":{"content":"hi","meta":{"from":"alice"}},"jsonrpc":"2.0"}
 ```
 
-Add permissions in `~/.claude/settings.json`:
+**Meta key rule**: keys must be identifiers (`[a-zA-Z0-9_]+`). The CLI silently drops anything else. We filter via `_meta_safe()`.
 
-```json
-{
-  "permissions": {
-    "allow": ["mcp__session-intercom__*"]
-  }
-}
+### 4. Run a tailer task alongside `Server.run()`
+
+```python
+import anyio
+from mcp.server.stdio import stdio_server
+
+async def main():
+    async with stdio_server() as (read_stream, write_stream):
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(tailer_loop, write_stream)
+            await server.run(read_stream, write_stream, init_options)
+            tg.cancel_scope.cancel()
 ```
 
-### 3. Launch Claude Code with channels enabled
+The tailer reads from shared state and calls `emit_channel(write_stream, ...)` for each new message. Inject *anywhere* you want push semantics — webhooks, queue events, DB changes, an inter-process message bus.
 
-session-intercom uses the [Channels API](https://code.claude.com/docs/en/channels-reference), currently in research preview. Custom channels aren't on Anthropic's allowlist, so launch with:
+### 5. **Use a separate cursor for the tailer.** ← critical
+
+Channel notifications are **fire-and-forget at the transport layer**: `await write_stream.send(...)` resolves when bytes are written, not when Claude has consumed them. If the host wasn't launched with the channels flag (or anything else fails downstream), the notification is silently dropped. If your tailer also advances the read cursor that explicit `poll()` uses, **messages are permanently lost**.
+
+We learned this the painful way. Bug surfaced in the two-session smoke test that drove this README.
+
+Fix:
+
+```sql
+-- The tailer's cursor lives under a dedicated source key.
+INSERT INTO read_cursors (session_id, source, last_read_id)
+VALUES (?, 'tailer:channel', ?)
+ON CONFLICT (session_id, source)
+DO UPDATE SET last_read_id = MAX(read_cursors.last_read_id, excluded.last_read_id);
+```
+
+The tailer advances `tailer:channel`. Explicit `poll()` advances the per-sender / per-channel cursors. They never collide. If channels delivery silently fails, `poll()` is a working recovery path.
+
+---
+
+## Architecture
+
+```
+   Session A                                    Session B
+       |                                            |
+       | intercom_send(to_name="B", body="hi")      |
+       |             |                              |
+       |     [intercom MCP A (stdio subprocess)]    |
+       |             |                              |
+       |        [SQLite ~/.local/share/             |
+       |         session-intercom/intercom.db]      |
+       |             ^                              |
+       |             | tailer poll once/sec         |
+       |             |                              |
+       |     [intercom MCP B (stdio subprocess)]    |
+       |             |                              |
+       |             | notifications/claude/channel |
+       |             v                              |
+       |     [Claude Code B]                        |
+       |             |                              |
+       |             +---> <channel source="session-intercom"
+       |                     from="A" message_id="42">hi</channel>
+       |                   arrives in B's next turn
+```
+
+- Each Claude Code session spawns its own MCP subprocess via stdio
+- All subprocesses share a single SQLite database (WAL mode, FK on)
+- Each subprocess runs a background tailer task that polls SQLite once per second for messages addressed to its registered session
+- The tailer emits `notifications/claude/channel` on its own write stream — the same stream the host CLI is reading
+- The CLI delivers each notification as a `<channel>` tag at the start of the next turn (or wakes an idle session)
+
+---
+
+## Quick start (user perspective)
+
+### Install via plugin
+
+```
+/plugin marketplace add struktured-labs/claudemarketplace
+/plugin install session-intercom@struktured-labs
+```
+
+### Launch Claude Code with channels enabled
+
+The Channels API is in research preview. Custom channels aren't on Anthropic's allowlist, so use the dev flag:
 
 ```bash
+claude --dangerously-load-development-channels plugin:session-intercom@struktured-labs
+```
+
+**Gotcha**: the flag has two syntax forms and the wrong one fails silently:
+
+```bash
+# Plugin-installed channel (what we ship):
+claude --dangerously-load-development-channels plugin:session-intercom@struktured-labs
+
+# Bare .mcp.json entry (NOT what we ship):
 claude --dangerously-load-development-channels server:session-intercom
 ```
 
-The first session in a project shows a one-time consent prompt. After that, channels are active for that session for as long as the flag is in the launch command.
+Using `server:session-intercom` for a plugin-installed channel will leave delivery broken with no error. We hit this in production.
 
-### 4. Register the session
+### Register and send
 
-Just one call — no `TeamCreate`, no `team_name`:
-
-```
+```python
+# In any Claude Code session:
 intercom_register(name="my-session-name")
-```
 
-### 5. Send messages
-
-Your own name is implicit after register:
-
-```
+# Send a DM:
 intercom_send(to_name="recipient-name", body="Your message here")
+
+# Broadcast:
+intercom_broadcast(body="deploy is green", channel="general")
 ```
 
-The recipient's next turn includes the message as a `<channel source="session-intercom" from="my-session-name" message_id="42">Your message here</channel>` tag. No polling, no file inbox, no waiting on the CLI's old `InboxPoller`.
+After register, all other intercom tools default to this session's name. No per-call identity argument needed.
 
-## How it works
+---
 
-```
-Session A                                    Session B
-    |                                            |
-    | intercom_send(to_name="B", body="hi")      |
-    |             |                              |
-    |     [intercom MCP A]                       |
-    |             |                              |
-    |        [SQLite intercom.db]                |
-    |             ^                              |
-    |             | poll once / sec              |
-    |             |                              |
-    |     [intercom MCP B — tailer task]         |
-    |             |                              |
-    |             | notifications/claude/channel |
-    |             v                              |
-    |     [Claude Code B]                        |
-    |             |                              |
-    |             +------> <channel ...>hi</channel> arrives between turns
-```
-
-1. Sender's MCP inserts a row into the shared `intercom.db`
-2. Recipient's MCP runs a background tailer that polls the DB for messages addressed to its registered session
-3. For each new message, the tailer emits `notifications/claude/channel` directly on its stdio write stream
-4. Claude Code injects the notification as a `<channel>` tag on the next turn — same path as teammate messages
-
-## MCP tools
+## MCP tool surface
 
 | Tool | Purpose |
 |------|---------|
 | `intercom_register(name)` | Register and set this name as the session's identity for all later calls |
 | `intercom_send(to_name, body)` | Direct message — your own name is implicit |
 | `intercom_broadcast(body, channel="general")` | Broadcast to a channel |
-| `intercom_poll()` | Manual drain (rarely needed — channels deliver automatically) |
+| `intercom_poll()` | Drain via per-sender cursors — **independent of channel notification cursors**; works as recovery if channels silently fail |
 | `intercom_list_sessions()` | Discover registered sessions |
 | `intercom_history(...)` | Read-only message history with pagination |
 | `intercom_list_channels()` | List available broadcast channels |
 | `intercom_create_channel(channel_name)` | Create a new broadcast channel |
 | `intercom_cleanup(ttl_minutes=...)` | Remove sessions inactive for 2+ weeks (default) |
 
-## Features
+---
 
-- **Channels-API delivery** — Claude Code receives messages as native MCP `<channel>` tags between turns, no polling
-- **One-call setup** — just `intercom_register(name)`, no `TeamCreate` dance
-- **Direct messages + broadcast channels** — pub/sub with named channels (default: `general`)
-- **Threading** — reply to specific messages with `thread_id`
-- **Message history** — paginated history with `before_id` cursor
-- **Read cursors** — efficient tracking of unread messages per session
-- **Idempotent registration** — re-register anytime without errors; crashed sessions just reconnect
-- **Durable sessions** — two-week TTL, explicit `intercom_cleanup()` only
-- **Concurrent-safe** — SQLite WAL mode
+## SQLite schema
 
-## Architecture
+If you want to fork to a different storage backend (Redis, Postgres, FoundationDB), this is what you need to replicate. The shape is small.
+
+```sql
+CREATE TABLE sessions (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    last_heartbeat TEXT NOT NULL,
+    metadata TEXT,
+    team_name TEXT
+);
+
+CREATE TABLE channels (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    description TEXT
+);
+
+CREATE TABLE messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,   -- monotonic ordering matters
+    sender_id TEXT NOT NULL,
+    recipient_id TEXT,                       -- NULL for broadcasts
+    channel TEXT,                            -- NULL for DMs
+    body TEXT NOT NULL,
+    thread_id INTEGER,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (sender_id) REFERENCES sessions(id),
+    FOREIGN KEY (recipient_id) REFERENCES sessions(id),
+    FOREIGN KEY (thread_id) REFERENCES messages(id)
+);
+
+CREATE TABLE read_cursors (
+    session_id TEXT NOT NULL,
+    source TEXT NOT NULL,                    -- '<sender_id>' for DMs,
+                                              -- 'ch:<channel>' for channels,
+                                              -- 'tailer:channel' for the tailer
+    last_read_id INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (session_id, source),
+    FOREIGN KEY (session_id) REFERENCES sessions(id)
+);
+```
+
+**Source-key convention** in `read_cursors`:
+- `<sender_id>` (uuid) → per-sender DM read cursor (advanced by `intercom_poll`)
+- `ch:<channel_name>` → per-channel read cursor (advanced by `intercom_poll`)
+- `tailer:channel` → tailer's own cursor (advanced by `db.fetch_for_channel_tailer`)
+
+These three never collide. Keeping the tailer cursor disjoint is what guarantees recovery on silent channel-delivery failure.
+
+---
+
+## Gotchas we discovered (in priority order)
+
+1. **`FastMCP` drops `experimental` capabilities silently.** Always use the low-level `mcp.server.Server`. There is no error; just no deliveries.
+
+2. **Launch flag syntax: `plugin:` vs `server:`.** Plugin-installed channels need `plugin:<name>@<marketplace>`. Bare `.mcp.json` entries need `server:<name>`. Wrong form = silent failure.
+
+3. **Tailer must not share cursors with `poll`.** If it does, a failed notification eats the cursor and the message vanishes. We split the cursor in 0.6.1.
+
+4. **Meta keys must be identifiers.** Keys with hyphens, dots, or other non-alphanum-underscore characters are silently dropped by the CLI. Filter at emit time.
+
+5. **Notifications are fire-and-forget at the transport.** `await write_stream.send(...)` resolves when bytes are written, not when Claude has read them. Don't add ack semantics — there aren't any. Build the recovery path you'd need if delivery failed (we did, via the cursor split).
+
+6. **`uvx` caches builds.** A restart doesn't pick up new code if the build is cached. Use `uvx --refresh` or `uvx cache prune` after pushing fixes.
+
+7. **The host has to be launched with `CLAUDE_CODE_DEBUG=1`** if you want to inspect what the CLI does with your notifications. Otherwise `~/.claude/debug/<session-id>.txt` doesn't exist.
+
+8. **Claude Desktop does not support channels** as of 2026-06. CLI only. Desktop's idle sessions can't be woken by external events yet.
+
+9. **Notifications wake idle sessions.** This is a real behavior change from pre-channels MCP, where servers were passive. With channels, an MCP server can drive a session into action without the user typing anything. Treat this as the powerful primitive it is.
+
+---
+
+## Layout
 
 ```
 src/session_intercom/
-  server.py   — low-level MCP server: tool handlers + channel tailer task
-  db/         — SQLite layer (sessions / messages / channels / cleanup)
-  models.py   — Session, Message, Channel dataclasses
+  server.py        — low-level MCP server: tool handlers + channel tailer task
+  db/              — SQLite layer
+    _common.py     — connection, schema, validators, constants
+    sessions.py    — register / heartbeat / list / lookup
+    messages.py    — send / broadcast / poll / history / fetch_for_channel_tailer
+    channels.py    — list / create
+    cleanup.py     — TTL-based stale-session sweep
+  models.py        — Session, Message, Channel dataclasses
 ```
-
-- **Database**: `~/.local/share/session-intercom/intercom.db` (SQLite, WAL mode)
-- **Transport**: MCP stdio. Inbound delivery via `notifications/claude/channel`
-- **Capability declared**: `experimental: {"claude/channel": {}}` in the MCP `initialize` response — this is what makes Claude Code register a notification listener
 
 ## Running tests
 
@@ -144,23 +298,33 @@ src/session_intercom/
 uv run --extra dev pytest tests/ -v
 ```
 
+36 tests cover: idempotent registration, heartbeat refresh, FK-safe cleanup, cursor-split semantics, MCP tool dispatch, the JSON-RPC wire format we emit, and meta-key sanitization.
+
 ## Migration from 0.5.x (file-inbox era)
 
-Before 0.6, session-intercom wrote to `~/.claude/teams/<name>/inboxes/team-lead.json` and relied on the CLI's `InboxPoller` to pick it up. That path required `TeamCreate`, was vulnerable to stale `leadSessionId` bindings, and exposed `delivery_health` / `inbox_file_ready` / recovery recipes to work around the binding bug class.
+If you're on the pre-channels file-inbox path:
 
-All of that is gone in 0.6:
+- Drop `team_name=` from `intercom_register` calls — argument is gone
+- Drop any handling of `delivery_health`, `inbox_file_ready`, `next_step`, `recovery`, `binding_mismatch`, `unread_in_file_inbox` response fields — all gone
+- Delete any `TeamCreate` / `TeamDelete` calls used for intercom setup — not needed
+- Drop `intercom_diagnose` calls — tool removed
+- Add `--dangerously-load-development-channels plugin:session-intercom@struktured-labs` to your Claude Code launch command
 
-- No more `team_name` argument on `intercom_register`
-- No more `inbox.py` / file inbox / `TeamCreate` setup
-- No more `intercom_diagnose` (its purpose was diagnosing file-inbox brokenness)
-- No more `delivery_health`, `inbox_file_ready`, `next_step`, `recovery`, `binding_mismatch` response fields
-- No more session-restart-or-not debate
-
-The Channels API gives us delivery semantics with the right invariant: the notification goes out on *this* session's MCP stdio, so it can't be misrouted by a stale binding.
+The DB schema is forward-compatible. Existing message history is preserved.
 
 ## Requirements
 
 - Python >= 3.11
 - Claude Code v2.1.80 or later (channels support)
-- Channels enabled per session: `claude --dangerously-load-development-channels server:session-intercom` until Anthropic allowlists this plugin
-- uv (for running)
+- `uv` for managing the venv and running
+
+## Upstream
+
+- **Source**: https://github.com/struktured-labs/session-intercom
+- **Plugin**: [`struktured-labs/claudemarketplace`](https://github.com/struktured-labs/claudemarketplace), `plugins/session-intercom/`
+- **Channels API docs**: https://code.claude.com/docs/en/channels-reference
+- **Tracking issue that drove channels into the CLI**: https://github.com/anthropics/claude-code/issues/33679
+
+## License
+
+MIT
