@@ -24,7 +24,10 @@ if TYPE_CHECKING:
         CLEANUP_MINUTES,
         DB_DIR,
         DB_PATH,
+        DEFAULT_BACKLOG,
+        DEFAULT_CHANNEL,
         MAX_BODY_SIZE,
+        MAX_NOTIFICATION_CHARS,
         NAME_RE,
         STALE_MINUTES,
     )
@@ -34,6 +37,7 @@ from .messages import (
     broadcast_message,
     fetch_for_channel_tailer,
     get_history,
+    init_tailer_cursor,
     poll_messages,
     send_message,
 )
@@ -42,6 +46,11 @@ from .sessions import (
     heartbeat,
     list_sessions,
     register_session,
+)
+from .subscriptions import (
+    list_subscriptions,
+    subscribe,
+    unsubscribe,
 )
 
 # Mutable constants live in _common; proxying them via __getattr__ keeps
@@ -52,7 +61,10 @@ _PROXIED_CONSTANTS = frozenset(
         "CLEANUP_MINUTES",
         "DB_DIR",
         "DB_PATH",
+        "DEFAULT_BACKLOG",
+        "DEFAULT_CHANNEL",
         "MAX_BODY_SIZE",
+        "MAX_NOTIFICATION_CHARS",
         "NAME_RE",
         "STALE_MINUTES",
     }
@@ -72,7 +84,10 @@ __all__ = [
     "CLEANUP_MINUTES",
     "DB_DIR",
     "DB_PATH",
+    "DEFAULT_BACKLOG",
+    "DEFAULT_CHANNEL",
     "MAX_BODY_SIZE",
+    "MAX_NOTIFICATION_CHARS",
     "NAME_RE",
     "STALE_MINUTES",
     # connection
@@ -91,6 +106,11 @@ __all__ = [
     "poll_messages",
     "get_history",
     "fetch_for_channel_tailer",
+    "init_tailer_cursor",
+    # subscriptions
+    "list_subscriptions",
+    "subscribe",
+    "unsubscribe",
     # channels
     "list_channels",
     "create_channel",

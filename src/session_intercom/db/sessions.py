@@ -7,7 +7,31 @@ import uuid
 import aiosqlite
 
 from ..models import Session
-from ._common import STALE_MINUTES, _now, get_connection, validate_name
+from ._common import DEFAULT_CHANNEL, STALE_MINUTES, _now, get_connection, validate_name
+
+
+async def _ensure_default_subscription(db: aiosqlite.Connection, session_id: str) -> None:
+    """Subscribe to the default channel when a session has no subscriptions.
+
+    Only fires on an empty subscription set, so an agent that deliberately
+    unsubscribed from everything stays muted across re-registration.
+
+    subscribed_at is backdated to the epoch on purpose: the tailer filters
+    channel messages by `created_at >= subscribed_at`, and for the default
+    subscription we want the backlog cap — not the subscription timestamp —
+    to decide how much history a joining session sees. Explicit
+    intercom_subscribe stamps the real time so mid-session subscribes stay
+    quiet.
+    """
+    rows = await db.execute_fetchall(
+        "SELECT 1 FROM channel_subscriptions WHERE session_id = ? LIMIT 1", (session_id,)
+    )
+    if not rows:
+        await db.execute(
+            "INSERT OR IGNORE INTO channel_subscriptions (session_id, channel, subscribed_at)"
+            " VALUES (?, ?, ?)",
+            (session_id, DEFAULT_CHANNEL, "1970-01-01T00:00:00.000000Z"),
+        )
 
 
 async def register_session(
@@ -28,6 +52,7 @@ async def register_session(
                 "team_name = COALESCE(?, team_name) WHERE id = ?",
                 (now, metadata, team_name, existing["id"]),
             )
+            await _ensure_default_subscription(db, existing["id"])
             await db.commit()
             return Session(
                 id=existing["id"],
@@ -44,6 +69,7 @@ async def register_session(
             " VALUES (?, ?, ?, ?, ?, ?)",
             (session_id, name, now, now, metadata, team_name),
         )
+        await _ensure_default_subscription(db, session_id)
         await db.commit()
         return Session(
             id=session_id,

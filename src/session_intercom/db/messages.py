@@ -140,6 +140,25 @@ async def poll_messages(
 
 _TAILER_CURSOR_SOURCE = "tailer:channel"
 
+# What the tailer is allowed to push: DMs addressed to this session (always),
+# plus broadcasts on channels this session subscribed to. Own messages never
+# echo back. A channel message only counts once the subscription predates it,
+# so subscribing mid-session doesn't replay that channel's whole history.
+# The register-time default subscription is backdated (see sessions.py) so the
+# backlog cap governs it instead. Binds session_id three times.
+_TAILER_ELIGIBLE_SQL = """(
+    m.recipient_id = ?
+    OR (
+        m.channel IS NOT NULL
+        AND m.sender_id != ?
+        AND EXISTS (
+            SELECT 1 FROM channel_subscriptions cs
+            WHERE cs.session_id = ? AND cs.channel = m.channel
+              AND m.created_at >= cs.subscribed_at
+        )
+    )
+)"""
+
 
 async def fetch_for_channel_tailer(name: str, limit: int = 20) -> list[Message]:
     """Read new messages for the tailer to emit as channel notifications.
@@ -161,11 +180,11 @@ async def fetch_for_channel_tailer(name: str, limit: int = 20) -> list[Message]:
         session_id = session["id"]
 
         rows = await db.execute_fetchall(
-            """
+            f"""
             SELECT m.*, s.name AS sender_name
             FROM messages m
             JOIN sessions s ON s.id = m.sender_id
-            WHERE (m.recipient_id = ? OR (m.channel IS NOT NULL AND m.sender_id != ?))
+            WHERE {_TAILER_ELIGIBLE_SQL}
               AND m.id > COALESCE(
                 (SELECT last_read_id FROM read_cursors
                  WHERE session_id = ? AND source = ?), 0
@@ -173,8 +192,8 @@ async def fetch_for_channel_tailer(name: str, limit: int = 20) -> list[Message]:
             ORDER BY m.id
             LIMIT ?
             """,
-            (session_id, session_id, session_id, _TAILER_CURSOR_SOURCE, limit),
-        )
+            (session_id, session_id, session_id, session_id, _TAILER_CURSOR_SOURCE, limit),
+        )  # 3 for _TAILER_ELIGIBLE_SQL, then cursor lookup (session_id, source), then limit
         messages = [_row_to_message(r) for r in rows]
 
         if messages:
@@ -190,6 +209,74 @@ async def fetch_for_channel_tailer(name: str, limit: int = 20) -> list[Message]:
             )
             await db.commit()
         return messages
+    finally:
+        await db.close()
+
+
+async def init_tailer_cursor(name: str, backlog: int) -> dict:
+    """Cap how much history the tailer will replay on (re)registration.
+
+    A fresh session's tailer cursor is 0, so without this it emits every
+    message ever addressed to it — for a busy `general` channel that is
+    hundreds of messages and enough context to force a compaction on startup.
+
+    Jumps the cursor forward so at most `backlog` messages remain pending.
+    Returns {"pending": n, "skipped": m} so the caller can tell the agent
+    what was dropped (still reachable via intercom_history).
+    """
+    backlog = max(backlog, 0)
+    db = await get_connection()
+    try:
+        session = await get_session_by_name(db, name)
+        session_id = session["id"]
+        args = (session_id, session_id, session_id, session_id, _TAILER_CURSOR_SOURCE)
+
+        count_rows = await db.execute_fetchall(
+            f"""
+            SELECT COUNT(*) AS n
+            FROM messages m
+            WHERE {_TAILER_ELIGIBLE_SQL}
+              AND m.id > COALESCE(
+                (SELECT last_read_id FROM read_cursors
+                 WHERE session_id = ? AND source = ?), 0
+              )
+            """,
+            args,
+        )
+        eligible = count_rows[0]["n"] if count_rows else 0
+        if eligible <= backlog:
+            return {"pending": eligible, "skipped": 0}
+
+        # The (backlog+1)-th newest message is the newest one we want to SKIP.
+        # Parking the cursor there leaves exactly `backlog` pending.
+        boundary_rows = await db.execute_fetchall(
+            f"""
+            SELECT m.id
+            FROM messages m
+            WHERE {_TAILER_ELIGIBLE_SQL}
+              AND m.id > COALESCE(
+                (SELECT last_read_id FROM read_cursors
+                 WHERE session_id = ? AND source = ?), 0
+              )
+            ORDER BY m.id DESC
+            LIMIT 1 OFFSET ?
+            """,
+            (*args, backlog),
+        )
+        if not boundary_rows:
+            return {"pending": eligible, "skipped": 0}
+
+        await db.execute(
+            """
+            INSERT INTO read_cursors (session_id, source, last_read_id)
+            VALUES (?, ?, ?)
+            ON CONFLICT (session_id, source)
+            DO UPDATE SET last_read_id = MAX(read_cursors.last_read_id, excluded.last_read_id)
+            """,
+            (session_id, _TAILER_CURSOR_SOURCE, boundary_rows[0]["id"]),
+        )
+        await db.commit()
+        return {"pending": backlog, "skipped": eligible - backlog}
     finally:
         await db.close()
 

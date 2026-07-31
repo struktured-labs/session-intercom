@@ -16,6 +16,13 @@ NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
 STALE_MINUTES = 20160  # 2 weeks
 CLEANUP_MINUTES = 20160  # 2 weeks
 
+# Context-budget guards. A fresh session's tailer cursor starts at 0, so
+# without a cap it replays every message ever addressed to it — enough to
+# force a compaction on startup. See init_tailer_cursor().
+DEFAULT_BACKLOG = 10
+MAX_NOTIFICATION_CHARS = 2000
+DEFAULT_CHANNEL = "general"
+
 SCHEMA = """\
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
@@ -55,12 +62,29 @@ CREATE TABLE IF NOT EXISTS read_cursors (
     FOREIGN KEY (session_id) REFERENCES sessions(id)
 );
 
+CREATE TABLE IF NOT EXISTS channel_subscriptions (
+    session_id TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    subscribed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (session_id, channel),
+    FOREIGN KEY (session_id) REFERENCES sessions(id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient_id, id);
 CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel, id);
 CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id, id);
 CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_id, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_heartbeat ON sessions(last_heartbeat);
 CREATE INDEX IF NOT EXISTS idx_sessions_name ON sessions(name);
+CREATE INDEX IF NOT EXISTS idx_subs_session ON channel_subscriptions(session_id);
+"""
+
+# Backfill: pre-0.7 sessions predate channel_subscriptions and implicitly
+# received every channel. Subscribe them to the default channel so upgrading
+# doesn't silently mute them.
+MIGRATION_BACKFILL_SUBS = """\
+INSERT OR IGNORE INTO channel_subscriptions (session_id, channel, subscribed_at)
+SELECT id, 'general', '1970-01-01T00:00:00.000000Z' FROM sessions;
 """
 
 MIGRATION_TEAM_NAME = """\
@@ -104,6 +128,7 @@ async def init_db() -> None:
         columns = {row[1] for row in await cursor.fetchall()}
         if "team_name" not in columns:
             await db.executescript(MIGRATION_TEAM_NAME)
+        await db.executescript(MIGRATION_BACKFILL_SUBS)
         await db.commit()
     finally:
         await db.close()

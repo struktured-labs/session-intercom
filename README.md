@@ -16,9 +16,9 @@ Before this, our previous implementation wrote to `~/.claude/teams/<name>/inboxe
 
 ---
 
-## The integration in 60 lines of code
+## The integration in ~60 lines of code
 
-Five load-bearing pieces. Everything else is plumbing.
+Six load-bearing pieces. Everything else is plumbing.
 
 ### 1. Use the low-level `mcp.server.Server`, not `FastMCP`
 
@@ -105,6 +105,23 @@ DO UPDATE SET last_read_id = MAX(read_cursors.last_read_id, excluded.last_read_i
 
 The tailer advances `tailer:channel`. Explicit `poll()` advances the per-sender / per-channel cursors. They never collide. If channels delivery silently fails, `poll()` is a working recovery path.
 
+### 6. **Cap the replay on join.** ← the other context killer
+
+A fresh session's tailer cursor is 0, so it replays *every* message ever addressed to it. On our own network that meant 786 channel messages at ~2KB each — **~1.5 MB dumped into a brand-new session's context**, enough to force a compaction before the agent did any work.
+
+Two mechanisms, both in 0.7.0:
+
+**Backlog cap.** On register, jump the tailer cursor forward so at most N messages remain pending (default 10, `backlog=0` for a clean start). Report what was skipped so the agent knows to reach for history if it needs more:
+
+```python
+replay = await db.init_tailer_cursor(name, backlog=10)
+# {"pending": 10, "skipped": 776}
+```
+
+**Channel subscriptions.** Broadcasts only reach subscribers. A `channel_subscriptions` table gates channel eligibility; DMs are never gated (you can't mute someone messaging you directly). Subscribing mid-session only opens the tap for *new* traffic — `subscribed_at` is compared against `created_at`, so joining a busy channel doesn't replay its history. The register-time default subscription is deliberately backdated to the epoch so the backlog cap governs it instead.
+
+Also worth doing: truncate individual notification bodies (we cap at 2000 chars with a pointer to `intercom_history`). Bodies can be 32KB; a few of those in one turn is a real slice of the window.
+
 ---
 
 ## Architecture
@@ -190,13 +207,15 @@ After register, all other intercom tools default to this session's name. No per-
 
 | Tool | Purpose |
 |------|---------|
-| `intercom_register(name)` | Register and set this name as the session's identity for all later calls |
+| `intercom_register(name, backlog=10)` | Register, set session identity, auto-subscribe to `general`, and cap replayed history |
 | `intercom_send(to_name, body)` | Direct message — your own name is implicit |
 | `intercom_broadcast(body, channel="general")` | Broadcast to a channel |
 | `intercom_poll()` | Drain via per-sender cursors — **independent of channel notification cursors**; works as recovery if channels silently fail |
 | `intercom_list_sessions()` | Discover registered sessions |
 | `intercom_history(...)` | Read-only message history with pagination |
-| `intercom_list_channels()` | List available broadcast channels |
+| `intercom_subscribe(channel)` | Start receiving a broadcast channel (new traffic only) |
+| `intercom_unsubscribe(channel)` | Stop receiving a channel — cuts context noise. DMs unaffected |
+| `intercom_list_channels()` | List channels, each flagged with your `subscribed` state |
 | `intercom_create_channel(channel_name)` | Create a new broadcast channel |
 | `intercom_cleanup(ttl_minutes=...)` | Remove sessions inactive for 2+ weeks (default) |
 
@@ -236,6 +255,15 @@ CREATE TABLE messages (
     FOREIGN KEY (thread_id) REFERENCES messages(id)
 );
 
+CREATE TABLE channel_subscriptions (
+    session_id TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    subscribed_at TEXT NOT NULL,             -- gates replay: only messages
+                                              -- created at/after this land
+    PRIMARY KEY (session_id, channel),
+    FOREIGN KEY (session_id) REFERENCES sessions(id)
+);
+
 CREATE TABLE read_cursors (
     session_id TEXT NOT NULL,
     source TEXT NOT NULL,                    -- '<sender_id>' for DMs,
@@ -262,19 +290,21 @@ These three never collide. Keeping the tailer cursor disjoint is what guarantees
 
 2. **Launch flag syntax: `plugin:` vs `server:`.** Plugin-installed channels need `plugin:<name>@<marketplace>`. Bare `.mcp.json` entries need `server:<name>`. Wrong form = silent failure.
 
-3. **Tailer must not share cursors with `poll`.** If it does, a failed notification eats the cursor and the message vanishes. We split the cursor in 0.6.1.
+3. **Cap the replay on join or you will blow up fresh sessions.** Tailer cursor starts at 0 = full history replay. We measured 786 messages / ~1.5 MB on our own network. Backlog cap + channel subscriptions + per-message truncation.
 
-4. **Meta keys must be identifiers.** Keys with hyphens, dots, or other non-alphanum-underscore characters are silently dropped by the CLI. Filter at emit time.
+4. **Tailer must not share cursors with `poll`.** If it does, a failed notification eats the cursor and the message vanishes. We split the cursor in 0.6.1.
 
-5. **Notifications are fire-and-forget at the transport.** `await write_stream.send(...)` resolves when bytes are written, not when Claude has read them. Don't add ack semantics — there aren't any. Build the recovery path you'd need if delivery failed (we did, via the cursor split).
+5. **Meta keys must be identifiers.** Keys with hyphens, dots, or other non-alphanum-underscore characters are silently dropped by the CLI. Filter at emit time.
 
-6. **`uvx` caches builds.** A restart doesn't pick up new code if the build is cached. Use `uvx --refresh` or `uvx cache prune` after pushing fixes.
+6. **Notifications are fire-and-forget at the transport.** `await write_stream.send(...)` resolves when bytes are written, not when Claude has read them. Don't add ack semantics — there aren't any. Build the recovery path you'd need if delivery failed (we did, via the cursor split).
 
-7. **The host has to be launched with `CLAUDE_CODE_DEBUG=1`** if you want to inspect what the CLI does with your notifications. Otherwise `~/.claude/debug/<session-id>.txt` doesn't exist.
+7. **`uvx` caches builds.** A restart doesn't pick up new code if the build is cached. Use `uvx --refresh` or `uvx cache prune` after pushing fixes.
 
-8. **Claude Desktop does not support channels** as of 2026-06. CLI only. Desktop's idle sessions can't be woken by external events yet.
+8. **The host has to be launched with `CLAUDE_CODE_DEBUG=1`** if you want to inspect what the CLI does with your notifications. Otherwise `~/.claude/debug/<session-id>.txt` doesn't exist.
 
-9. **Notifications wake idle sessions.** This is a real behavior change from pre-channels MCP, where servers were passive. With channels, an MCP server can drive a session into action without the user typing anything. Treat this as the powerful primitive it is.
+9. **Claude Desktop does not support channels** as of 2026-06. CLI only. Desktop's idle sessions can't be woken by external events yet.
+
+10. **Notifications wake idle sessions.** This is a real behavior change from pre-channels MCP, where servers were passive. With channels, an MCP server can drive a session into action without the user typing anything. Treat this as the powerful primitive it is.
 
 ---
 
@@ -288,6 +318,7 @@ src/session_intercom/
     sessions.py    — register / heartbeat / list / lookup
     messages.py    — send / broadcast / poll / history / fetch_for_channel_tailer
     channels.py    — list / create
+    subscriptions.py — per-session channel subscribe/unsubscribe
     cleanup.py     — TTL-based stale-session sweep
   models.py        — Session, Message, Channel dataclasses
 ```
@@ -298,7 +329,7 @@ src/session_intercom/
 uv run --extra dev pytest tests/ -v
 ```
 
-36 tests cover: idempotent registration, heartbeat refresh, FK-safe cleanup, cursor-split semantics, MCP tool dispatch, the JSON-RPC wire format we emit, and meta-key sanitization.
+45 tests cover: idempotent registration, heartbeat refresh, FK-safe cleanup, cursor-split semantics, backlog capping, subscription gating, MCP tool dispatch, the JSON-RPC wire format we emit, and meta-key sanitization.
 
 ## Migration from 0.5.x (file-inbox era)
 

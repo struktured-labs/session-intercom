@@ -361,3 +361,134 @@ async def test_tailer_does_not_pick_up_own_broadcasts():
 
     tailed = await db.fetch_for_channel_tailer("alice")
     assert tailed == []
+
+
+# --- Backlog cap + channel subscriptions (0.7.0) ---
+
+
+@pytest.mark.asyncio
+async def test_register_auto_subscribes_to_general():
+    await db.init_db()
+    await db.register_session("alice")
+    assert await db.list_subscriptions("alice") == ["general"]
+
+
+@pytest.mark.asyncio
+async def test_unsubscribe_survives_reregistration():
+    """A deliberate unsubscribe must not be undone by re-registering."""
+    await db.init_db()
+    await db.register_session("alice")
+    await db.create_channel("noisy")
+    await db.subscribe("alice", "noisy")
+    await db.unsubscribe("alice", "general")
+    assert await db.list_subscriptions("alice") == ["noisy"]
+
+    await db.register_session("alice")
+    assert await db.list_subscriptions("alice") == ["noisy"], "re-register must not re-add general"
+
+
+@pytest.mark.asyncio
+async def test_tailer_skips_unsubscribed_channels():
+    await db.init_db()
+    await db.register_session("alice")
+    await db.register_session("bob")
+    await db.create_channel("noisy")
+
+    await db.broadcast_message("alice", "general msg", "general")
+    await db.broadcast_message("alice", "noisy msg", "noisy")
+
+    # bob is only subscribed to general
+    tailed = await db.fetch_for_channel_tailer("bob")
+    assert [m.body for m in tailed] == ["general msg"]
+
+    # subscribing mid-session only opens the tap for NEW traffic — the earlier
+    # "noisy msg" stays out of context (still readable via intercom_history)
+    await db.subscribe("bob", "noisy")
+    await db.broadcast_message("alice", "noisy msg 2", "noisy")
+    tailed2 = await db.fetch_for_channel_tailer("bob")
+    assert [m.body for m in tailed2] == ["noisy msg 2"]
+
+
+@pytest.mark.asyncio
+async def test_tailer_always_delivers_dms_regardless_of_subscriptions():
+    """DMs are not subscribable — you can't mute someone messaging you directly."""
+    await db.init_db()
+    await db.register_session("alice")
+    await db.register_session("bob")
+    await db.unsubscribe("bob", "general")
+
+    await db.send_message("alice", "bob", "direct message")
+    tailed = await db.fetch_for_channel_tailer("bob")
+    assert [m.body for m in tailed] == ["direct message"]
+
+
+@pytest.mark.asyncio
+async def test_backlog_cap_skips_old_messages():
+    """The whole point: a fresh session must not replay a huge channel history."""
+    await db.init_db()
+    await db.register_session("alice")
+    for i in range(25):
+        await db.broadcast_message("alice", f"msg{i}", "general")
+
+    # bob registers fresh with a backlog of 5
+    await db.register_session("bob")
+    replay = await db.init_tailer_cursor("bob", backlog=5)
+    assert replay == {"pending": 5, "skipped": 20}
+
+    tailed = await db.fetch_for_channel_tailer("bob", limit=100)
+    assert [m.body for m in tailed] == ["msg20", "msg21", "msg22", "msg23", "msg24"]
+
+
+@pytest.mark.asyncio
+async def test_backlog_zero_starts_clean():
+    await db.init_db()
+    await db.register_session("alice")
+    for i in range(10):
+        await db.broadcast_message("alice", f"msg{i}", "general")
+
+    await db.register_session("bob")
+    replay = await db.init_tailer_cursor("bob", backlog=0)
+    assert replay == {"pending": 0, "skipped": 10}
+    assert await db.fetch_for_channel_tailer("bob", limit=100) == []
+
+    # ...but new traffic still arrives
+    await db.broadcast_message("alice", "after registration", "general")
+    tailed = await db.fetch_for_channel_tailer("bob", limit=100)
+    assert [m.body for m in tailed] == ["after registration"]
+
+
+@pytest.mark.asyncio
+async def test_backlog_noop_when_under_cap():
+    await db.init_db()
+    await db.register_session("alice")
+    await db.register_session("bob")
+    await db.broadcast_message("alice", "only one", "general")
+
+    replay = await db.init_tailer_cursor("bob", backlog=10)
+    assert replay == {"pending": 1, "skipped": 0}
+    assert len(await db.fetch_for_channel_tailer("bob")) == 1
+
+
+@pytest.mark.asyncio
+async def test_backlog_does_not_touch_poll_cursor():
+    """Skipped-by-backlog messages must still be recoverable via intercom_poll."""
+    await db.init_db()
+    await db.register_session("alice")
+    await db.register_session("bob")
+    for i in range(10):
+        await db.send_message("alice", "bob", f"dm{i}")
+
+    await db.init_tailer_cursor("bob", backlog=2)
+    # tailer only replays the last 2...
+    assert len(await db.fetch_for_channel_tailer("bob", limit=100)) == 2
+    # ...but poll still sees all 10, because its cursors are untouched
+    polled, _ = await db.poll_messages("bob", limit=100)
+    assert len(polled) == 10
+
+
+@pytest.mark.asyncio
+async def test_subscribe_to_missing_channel_errors():
+    await db.init_db()
+    await db.register_session("alice")
+    with pytest.raises(ValueError, match="not found"):
+        await db.subscribe("alice", "nonexistent")

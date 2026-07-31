@@ -32,7 +32,7 @@ from mcp.types import JSONRPCMessage, JSONRPCNotification
 
 from . import db
 
-__version__ = "0.6.2"
+__version__ = "0.7.0"
 
 logger = logging.getLogger("session-intercom")
 
@@ -75,7 +75,8 @@ async def list_tools() -> list[types.Tool]:
                 "Register this session with the intercom network. After registering, "
                 "all other intercom tools default to this name. Inbound messages arrive "
                 'between turns as <channel source="session-intercom" ...> tags via MCP '
-                "push — no polling, no file inbox."
+                "push — no polling, no file inbox. Auto-subscribes to the 'general' "
+                "channel; manage with intercom_subscribe / intercom_unsubscribe."
             ),
             inputSchema={
                 "type": "object",
@@ -85,6 +86,16 @@ async def list_tools() -> list[types.Tool]:
                         "description": "Your session name (alphanumeric/hyphens, 1-64 chars).",
                     },
                     "metadata": {"type": ["string", "null"]},
+                    "backlog": {
+                        "type": "integer",
+                        "default": db.DEFAULT_BACKLOG,
+                        "description": (
+                            "How many recent messages the tailer may replay on register. "
+                            "Older ones are skipped (still readable via intercom_history). "
+                            "0 = start clean from now. Guards against a busy channel "
+                            "flooding a fresh session's context."
+                        ),
+                    },
                 },
                 "required": ["name"],
             },
@@ -163,6 +174,36 @@ async def list_tools() -> list[types.Tool]:
             },
         ),
         types.Tool(
+            name="intercom_subscribe",
+            description=(
+                "Subscribe to a broadcast channel so its messages reach you as "
+                "<channel> tags. DMs always arrive regardless of subscriptions."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "channel": {"type": "string"},
+                    "name": {"type": ["string", "null"]},
+                },
+                "required": ["channel"],
+            },
+        ),
+        types.Tool(
+            name="intercom_unsubscribe",
+            description=(
+                "Stop receiving a broadcast channel. Cuts context noise from busy "
+                "channels you don't need. DMs are unaffected."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "channel": {"type": "string"},
+                    "name": {"type": ["string", "null"]},
+                },
+                "required": ["channel"],
+            },
+        ),
+        types.Tool(
             name="intercom_list_channels",
             description="List available broadcast channels.",
             inputSchema={"type": "object", "properties": {}},
@@ -197,9 +238,19 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
         if name == "intercom_register":
             session = await db.register_session(arguments["name"], arguments.get("metadata"), None)
             _current_session = arguments["name"]
+            backlog = arguments.get("backlog", db.DEFAULT_BACKLOG)
+            replay = await db.init_tailer_cursor(arguments["name"], backlog)
+            subs = await db.list_subscriptions(arguments["name"])
             if not _tailer_ready.is_set():
                 _tailer_ready.set()
-            return _ok({"status": "registered", "session": asdict(session)})
+            return _ok(
+                {
+                    "status": "registered",
+                    "session": asdict(session),
+                    "subscriptions": subs,
+                    "backlog": replay,
+                }
+            )
 
         if name == "intercom_send":
             sender = _resolve_name(arguments.get("from_name"))
@@ -264,9 +315,31 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
                 }
             )
 
+        if name == "intercom_subscribe":
+            session_name = _resolve_name(arguments.get("name"))
+            subs = await db.subscribe(session_name, arguments["channel"])
+            return _ok(
+                {"status": "subscribed", "channel": arguments["channel"], "subscriptions": subs}
+            )
+
+        if name == "intercom_unsubscribe":
+            session_name = _resolve_name(arguments.get("name"))
+            subs = await db.unsubscribe(session_name, arguments["channel"])
+            return _ok(
+                {"status": "unsubscribed", "channel": arguments["channel"], "subscriptions": subs}
+            )
+
         if name == "intercom_list_channels":
             channels = await db.list_channels()
-            return _ok({"channels": [asdict(c) for c in channels], "count": len(channels)})
+            subs = (
+                set(await db.list_subscriptions(_resolve_name(None))) if _current_session else set()
+            )
+            return _ok(
+                {
+                    "channels": [{**asdict(c), "subscribed": c.name in subs} for c in channels],
+                    "count": len(channels),
+                }
+            )
 
         if name == "intercom_create_channel":
             channel = await db.create_channel(
@@ -304,6 +377,23 @@ async def _emit_channel(write_stream: Any, content: str, meta: dict[str, str]) -
         params={"content": content, "meta": meta},
     )
     await write_stream.send(SessionMessage(message=JSONRPCMessage(notification)))
+
+
+def _truncate_for_notification(body: str, message_id: int) -> str:
+    """Cap a single notification's context cost.
+
+    Bodies run up to MAX_BODY_SIZE (32KB); a handful in one turn is a
+    meaningful slice of the window. Truncate with a pointer to the full text
+    rather than dropping content silently.
+    """
+    limit = db.MAX_NOTIFICATION_CHARS
+    if len(body) <= limit:
+        return body
+    return (
+        body[:limit]
+        + f"\n\n[truncated — {len(body)} chars total. "
+        + f"Full text: intercom_history(thread_id={message_id}) or intercom_poll()]"
+    )
 
 
 def _meta_safe(d: dict[str, Any]) -> dict[str, str]:
@@ -349,7 +439,8 @@ async def _tailer_loop(write_stream: Any) -> None:
                         "thread_id": msg.thread_id,
                     }
                 )
-                await _emit_channel(write_stream, msg.body, meta)
+                body = _truncate_for_notification(msg.body, msg.id)
+                await _emit_channel(write_stream, body, meta)
                 logger.debug("emitted channel notification for msg %d", msg.id)
         except Exception:
             logger.exception("tailer iteration failed; continuing")
