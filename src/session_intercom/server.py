@@ -28,11 +28,11 @@ from mcp.server.lowlevel import NotificationOptions, Server
 from mcp.server.models import InitializationOptions
 from mcp.server.stdio import stdio_server
 from mcp.shared.message import SessionMessage
-from mcp.types import JSONRPCMessage, JSONRPCNotification
+from mcp.types import JSONRPCNotification
 
 from . import db
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 logger = logging.getLogger("session-intercom")
 
@@ -66,7 +66,6 @@ def _err(msg: str) -> list[types.TextContent]:
 server: Server = Server("session-intercom")
 
 
-@server.list_tools()
 async def list_tools() -> list[types.Tool]:
     return [
         types.Tool(
@@ -78,7 +77,7 @@ async def list_tools() -> list[types.Tool]:
                 "push — no polling, no file inbox. Auto-subscribes to the 'general' "
                 "channel; manage with intercom_subscribe / intercom_unsubscribe."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "name": {
@@ -106,7 +105,7 @@ async def list_tools() -> list[types.Tool]:
                 "Send a direct message. Recipient sees it as a <channel> tag on their "
                 "next turn. from_name defaults to your registered name."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "to_name": {"type": "string"},
@@ -120,7 +119,7 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="intercom_broadcast",
             description="Broadcast to a channel (default: 'general'). from_name defaults to your registered session.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "body": {"type": "string"},
@@ -134,7 +133,7 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="intercom_list_sessions",
             description="List all registered sessions.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {"include_stale": {"type": "boolean", "default": False}},
             },
@@ -142,7 +141,7 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="intercom_history",
             description="Retrieve message history (read-only — does not advance cursors).",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "with_session": {"type": ["string", "null"]},
@@ -163,7 +162,7 @@ async def list_tools() -> list[types.Tool]:
                 "(or channels otherwise silently fail), this is the recovery path — the "
                 "tailer's cursor is separate and won't have advanced these cursors."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "name": {"type": ["string", "null"]},
@@ -179,7 +178,7 @@ async def list_tools() -> list[types.Tool]:
                 "Subscribe to a broadcast channel so its messages reach you as "
                 "<channel> tags. DMs always arrive regardless of subscriptions."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "channel": {"type": "string"},
@@ -194,7 +193,7 @@ async def list_tools() -> list[types.Tool]:
                 "Stop receiving a broadcast channel. Cuts context noise from busy "
                 "channels you don't need. DMs are unaffected."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "channel": {"type": "string"},
@@ -206,12 +205,12 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="intercom_list_channels",
             description="List available broadcast channels.",
-            inputSchema={"type": "object", "properties": {}},
+            input_schema={"type": "object", "properties": {}},
         ),
         types.Tool(
             name="intercom_create_channel",
             description="Create a new broadcast channel.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "channel_name": {"type": "string"},
@@ -223,7 +222,7 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="intercom_cleanup",
             description="Remove sessions inactive for ttl_minutes (default: 2 weeks).",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {"ttl_minutes": {"type": "integer", "default": db.CLEANUP_MINUTES}},
             },
@@ -231,7 +230,6 @@ async def list_tools() -> list[types.Tool]:
     ]
 
 
-@server.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextContent]:
     global _current_session
     try:
@@ -360,6 +358,30 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
         return _err(str(e))
 
 
+# --- Handler registration (mcp >= 2 imperative API) ---
+#
+# mcp 2.0 dropped the @server.list_tools() / @server.call_tool() decorators for
+# add_request_handler(method, params_type, handler). Handlers receive a
+# ServerRequestContext plus a validated params model (never None — absent
+# `params` validates as {}). The thin adapters below keep list_tools/call_tool
+# as plain callables so tests can drive them directly.
+
+
+async def _handle_list_tools(
+    ctx: Any, params: types.PaginatedRequestParams
+) -> types.ListToolsResult:
+    return types.ListToolsResult(tools=await list_tools())
+
+
+async def _handle_call_tool(ctx: Any, params: types.CallToolRequestParams) -> types.CallToolResult:
+    content: list[types.ContentBlock] = list(await call_tool(params.name, params.arguments or {}))
+    return types.CallToolResult(content=content)
+
+
+server.add_request_handler("tools/list", types.PaginatedRequestParams, _handle_list_tools)
+server.add_request_handler("tools/call", types.CallToolRequestParams, _handle_call_tool)
+
+
 # --- Tailer: push new messages as channel notifications ---
 
 
@@ -370,13 +392,19 @@ async def _emit_channel(write_stream: Any, content: str, meta: dict[str, str]) -
     typed model for this Claude-specific method. The wire format is standard
     JSON-RPC 2.0; we hand-construct JSONRPCNotification and push it on the
     same stream Claude Code is reading on.
+
+    Writing straight to the transport is also why the 2.x move to
+    `subscriptions/listen` for change notifications doesn't affect us — that
+    governs the SDK's own notification helpers, not raw frames. stdio_server
+    serializes whatever `SessionMessage.message` holds; in 2.x JSONRPCMessage
+    is a plain type union, so the notification goes in unwrapped.
     """
     notification = JSONRPCNotification(
         jsonrpc="2.0",
         method="notifications/claude/channel",
         params={"content": content, "meta": meta},
     )
-    await write_stream.send(SessionMessage(message=JSONRPCMessage(notification)))
+    await write_stream.send(SessionMessage(message=notification))
 
 
 def _truncate_for_notification(body: str, message_id: int) -> str:

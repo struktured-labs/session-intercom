@@ -25,8 +25,22 @@ Six load-bearing pieces. Everything else is plumbing.
 ```python
 from mcp.server.lowlevel import Server, NotificationOptions
 from mcp.server.models import InitializationOptions
+import mcp.types as types
 
 server = Server("session-intercom")
+
+# mcp >= 2 registers handlers imperatively (the 1.x @server.list_tools() /
+# @server.call_tool() decorators are gone). Handlers take a request context
+# plus a validated params model — never None, an absent `params` validates
+# as {}.
+async def handle_list_tools(ctx, params: types.PaginatedRequestParams):
+    return types.ListToolsResult(tools=[...])
+
+async def handle_call_tool(ctx, params: types.CallToolRequestParams):
+    return types.CallToolResult(content=[...])
+
+server.add_request_handler("tools/list", types.PaginatedRequestParams, handle_list_tools)
+server.add_request_handler("tools/call", types.CallToolRequestParams, handle_call_tool)
 ```
 
 **Why**: `FastMCP` silently drops the `experimental` capability block. You will get zero errors and zero deliveries until you switch to the low-level class. We confirmed this both in the live spike and in the [GitHub thread that drove channels into the product](https://github.com/anthropics/claude-code/issues/33679#issuecomment-4104806674).
@@ -52,7 +66,7 @@ The SDK has no typed model for this Claude-specific method, so we hand-construct
 
 ```python
 from mcp.shared.message import SessionMessage
-from mcp.types import JSONRPCMessage, JSONRPCNotification
+from mcp.types import JSONRPCNotification
 
 async def emit_channel(write_stream, content: str, meta: dict[str, str]) -> None:
     notification = JSONRPCNotification(
@@ -60,7 +74,9 @@ async def emit_channel(write_stream, content: str, meta: dict[str, str]) -> None
         method="notifications/claude/channel",
         params={"content": content, "meta": meta},
     )
-    await write_stream.send(SessionMessage(message=JSONRPCMessage(notification)))
+    # No wrapper: in mcp >= 2 JSONRPCMessage is a plain type union, and
+    # stdio_server serializes whatever SessionMessage.message holds.
+    await write_stream.send(SessionMessage(message=notification))
 ```
 
 The on-wire payload is exactly:
@@ -304,7 +320,9 @@ These three never collide. Keeping the tailer cursor disjoint is what guarantees
 
 9. **Claude Desktop does not support channels** as of 2026-06. CLI only. Desktop's idle sessions can't be woken by external events yet.
 
-10. **Notifications wake idle sessions.** This is a real behavior change from pre-channels MCP, where servers were passive. With channels, an MCP server can drive a session into action without the user typing anything. Treat this as the powerful primitive it is.
+10. **The MCP Python SDK breaks across majors, and it breaks you at *runtime*.** Going 1.x → 2.0 moved handler registration (decorators → `add_request_handler`), turned `JSONRPCMessage` from a wrapper model into a bare type union (so the old constructor call raises `TypeError` mid-delivery), and renamed `Tool(inputSchema=)` to `input_schema=`. None of that is caught by importing the module. Pin deliberately, and keep a CI job that does a real stdio handshake against a *fresh* dependency resolution — cached envs keep working and hide the break.
+
+11. **Notifications wake idle sessions.** This is a real behavior change from pre-channels MCP, where servers were passive. With channels, an MCP server can drive a session into action without the user typing anything. Treat this as the powerful primitive it is.
 
 ---
 
@@ -329,7 +347,7 @@ src/session_intercom/
 uv run --extra dev pytest tests/ -v
 ```
 
-45 tests cover: idempotent registration, heartbeat refresh, FK-safe cleanup, cursor-split semantics, backlog capping, subscription gating, MCP tool dispatch, the JSON-RPC wire format we emit, and meta-key sanitization.
+49 tests cover: idempotent registration, heartbeat refresh, FK-safe cleanup, cursor-split semantics, backlog capping, subscription gating, MCP tool dispatch, SDK handler registration, the JSON-RPC wire format we emit, and meta-key sanitization.
 
 ## Migration from 0.5.x (file-inbox era)
 
@@ -346,6 +364,7 @@ The DB schema is forward-compatible. Existing message history is preserved.
 ## Requirements
 
 - Python >= 3.11
+- `mcp` >= 2.0.0
 - Claude Code v2.1.80 or later (channels support)
 - `uv` for managing the venv and running
 
