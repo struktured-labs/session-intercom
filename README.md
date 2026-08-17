@@ -25,8 +25,22 @@ Six load-bearing pieces. Everything else is plumbing.
 ```python
 from mcp.server.lowlevel import Server, NotificationOptions
 from mcp.server.models import InitializationOptions
+import mcp.types as types
 
 server = Server("session-intercom")
+
+# mcp >= 2 registers handlers imperatively (the 1.x @server.list_tools() /
+# @server.call_tool() decorators are gone). Handlers take a request context
+# plus a validated params model — never None, an absent `params` validates
+# as {}.
+async def handle_list_tools(ctx, params: types.PaginatedRequestParams):
+    return types.ListToolsResult(tools=[...])
+
+async def handle_call_tool(ctx, params: types.CallToolRequestParams):
+    return types.CallToolResult(content=[...])
+
+server.add_request_handler("tools/list", types.PaginatedRequestParams, handle_list_tools)
+server.add_request_handler("tools/call", types.CallToolRequestParams, handle_call_tool)
 ```
 
 **Why**: `FastMCP` silently drops the `experimental` capability block. You will get zero errors and zero deliveries until you switch to the low-level class. We confirmed this both in the live spike and in the [GitHub thread that drove channels into the product](https://github.com/anthropics/claude-code/issues/33679#issuecomment-4104806674).
@@ -52,7 +66,7 @@ The SDK has no typed model for this Claude-specific method, so we hand-construct
 
 ```python
 from mcp.shared.message import SessionMessage
-from mcp.types import JSONRPCMessage, JSONRPCNotification
+from mcp.types import JSONRPCNotification
 
 async def emit_channel(write_stream, content: str, meta: dict[str, str]) -> None:
     notification = JSONRPCNotification(
@@ -60,7 +74,9 @@ async def emit_channel(write_stream, content: str, meta: dict[str, str]) -> None
         method="notifications/claude/channel",
         params={"content": content, "meta": meta},
     )
-    await write_stream.send(SessionMessage(message=JSONRPCMessage(notification)))
+    # No wrapper: in mcp >= 2 JSONRPCMessage is a plain type union, and
+    # stdio_server serializes whatever SessionMessage.message holds.
+    await write_stream.send(SessionMessage(message=notification))
 ```
 
 The on-wire payload is exactly:
@@ -154,6 +170,92 @@ Also worth doing: truncate individual notification bodies (we cap at 2000 chars 
 - Each subprocess runs a background tailer task that polls SQLite once per second for messages addressed to its registered session
 - The tailer emits `notifications/claude/channel` on its own write stream — the same stream the host CLI is reading
 - The CLI delivers each notification as a `<channel>` tag at the start of the next turn (or wakes an idle session)
+
+---
+
+## Using it from other MCP clients (Codex, etc.)
+
+> Per-harness config for Codex, Cursor, OpenCode, Grok, Pi, Letta and Claude Code lives in **[docs/CLIENTS.md](docs/CLIENTS.md)**. This section covers why it works at all.
+
+The channels push is a **Claude Code optimization, not the delivery mechanism**. The tool surface is plain MCP, so any client can drive session-intercom — and agents on different harnesses can talk to each other through the same SQLite bus.
+
+Verified in production: a Codex (`gpt-5.6-sol`) session and a Claude Code session held a sustained bidirectional conversation, trading messages every 1–2 minutes.
+
+### Codex setup
+
+`~/.codex/config.toml`:
+
+```toml
+[mcp_servers.session-intercom]
+command = "uvx"
+args = ["--from", "git+https://github.com/struktured-labs/session-intercom@main", "session-intercom"]
+```
+
+### How a non-channels client receives
+
+Clients with no channel-notification concept drop the `notifications/claude/channel` frames as an unknown method and read on their own turns instead. The observed pattern, from a real Codex transcript:
+
+```
+22:31:38  intercom_register   {'name':'codex-penta-dx', 'backlog':0, ...}
+22:33:50  intercom_send       -> penta-dragon-dx-claude
+22:34:00  intercom_history    {'with_session':'penta-dragon-dx-claude','limit':6}
+22:35:08  intercom_broadcast  channel='penta-dragon-dx'
+22:35:52  intercom_history    limit:5
+22:39:03  intercom_send
+...
+23:20:06  intercom_history    limit:3
+```
+
+Two things to copy from it:
+
+**Read with `intercom_history`, never `intercom_poll`.** Every read in that transcript is `intercom_history(name=..., with_session=..., limit=3..6)`; there is not a single `poll` call. History is non-consuming, so an agent loop can re-read as often as it likes — twice in twelve seconds, as happened at 23:01:58 and 23:02:10 — without consuming anything or racing the tailer. `intercom_poll` *does* consume, which makes it the wrong primitive for a loop that may fire more than once per exchange. The cursor table confirms the shape: that session has no per-sender DM cursors at all.
+
+**Register with `backlog=0` if the client has no push.** Nothing will replay those messages into context, so a backlog only spends context on history the agent is about to re-read anyway.
+
+Sending is identical everywhere: `intercom_send(to_name=..., body=...)`.
+
+There is no polling *interval* — reads happen on whatever turns the host harness generates. In the Codex case those are autonomous goal-loop turns (`<codex_internal_context source="goal">`), and the gaps ranged from 10 seconds to 14 minutes.
+
+### If the client can't load an MCP server config
+
+Worth knowing because it is what actually happened above: a long-running session that predates the config edit never loads the new server. Codex worked around it by driving session-intercom as a subprocess from a scratch MCP client, which works from any language with an MCP SDK:
+
+```python
+# uv run --with mcp python - <<'PY'
+import asyncio
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+
+async def main():
+    p = StdioServerParameters(
+        command="uvx",
+        args=["--from", "git+https://github.com/struktured-labs/session-intercom@main",
+              "session-intercom"],
+    )
+    async with stdio_client(p) as (r, w):
+        async with ClientSession(r, w) as s:
+            await s.initialize()
+            out = await s.call_tool("intercom_history",
+                                    {"name": "me", "with_session": "them", "limit": 3})
+            for c in out.content:
+                print(getattr(c, "text", c))
+
+asyncio.run(main())
+```
+
+Each invocation is a fresh process and a fresh registration-free read — the session row already exists in SQLite, so only `intercom_register` needs calling once.
+
+### What this means for the design
+
+Delivery is layered, and each layer degrades independently:
+
+| Layer | Mechanism | Client support |
+|-------|-----------|----------------|
+| Storage | SQLite, monotonic message ids, per-source cursors | universal |
+| Read | `intercom_history` (non-consuming) / `intercom_poll` (consuming) | any MCP client |
+| Push | `notifications/claude/channel` → `<channel>` tags | Claude Code only |
+
+Only the push layer is Claude-specific, and losing it costs latency, not messages. That is also why the [cursor split](#5-use-a-separate-cursor-for-the-tailer--critical) matters: the tailer running against a client that ignores its notifications must not consume anything the read layer still owes the agent.
 
 ---
 
@@ -304,7 +406,9 @@ These three never collide. Keeping the tailer cursor disjoint is what guarantees
 
 9. **Claude Desktop does not support channels** as of 2026-06. CLI only. Desktop's idle sessions can't be woken by external events yet.
 
-10. **Notifications wake idle sessions.** This is a real behavior change from pre-channels MCP, where servers were passive. With channels, an MCP server can drive a session into action without the user typing anything. Treat this as the powerful primitive it is.
+10. **The MCP Python SDK breaks across majors, and it breaks you at *runtime*.** Going 1.x → 2.0 moved handler registration (decorators → `add_request_handler`), turned `JSONRPCMessage` from a wrapper model into a bare type union (so the old constructor call raises `TypeError` mid-delivery), and renamed `Tool(inputSchema=)` to `input_schema=`. None of that is caught by importing the module. Pin deliberately, and keep a CI job that does a real stdio handshake against a *fresh* dependency resolution — cached envs keep working and hide the break.
+
+11. **Notifications wake idle sessions.** This is a real behavior change from pre-channels MCP, where servers were passive. With channels, an MCP server can drive a session into action without the user typing anything. Treat this as the powerful primitive it is.
 
 ---
 
@@ -329,7 +433,29 @@ src/session_intercom/
 uv run --extra dev pytest tests/ -v
 ```
 
-45 tests cover: idempotent registration, heartbeat refresh, FK-safe cleanup, cursor-split semantics, backlog capping, subscription gating, MCP tool dispatch, the JSON-RPC wire format we emit, and meta-key sanitization.
+49 tests cover: idempotent registration, heartbeat refresh, FK-safe cleanup, cursor-split semantics, backlog capping, subscription gating, MCP tool dispatch, SDK handler registration, the JSON-RPC wire format we emit, and meta-key sanitization.
+
+## Upgrading to 0.8.0 (mcp 2.x)
+
+0.8.0 requires `mcp>=2.0.0`. If you added `--with "mcp<2"` anywhere as a workaround for the 1.x→2.0 break (that pin was the right call while the server was on the 1.x API), **remove it** — the constraint is now unsatisfiable and `uvx` will refuse to resolve:
+
+```
+× No solution found when resolving tool dependencies:
+╰─▶ session-intercom==0.8.0 depends on mcp>=2.0.0
+    And because you require session-intercom and mcp<2, we can conclude that
+    your requirements are unsatisfiable.
+```
+
+Check any MCP client config that names session-intercom:
+
+```toml
+# before
+args = ["--with", "mcp<2", "--from", "git+https://github.com/struktured-labs/session-intercom@main", "session-intercom"]
+# after
+args = ["--from", "git+https://github.com/struktured-labs/session-intercom@main", "session-intercom"]
+```
+
+The failure is loud (resolution error at spawn), not silent — the server just won't start.
 
 ## Migration from 0.5.x (file-inbox era)
 
@@ -346,6 +472,7 @@ The DB schema is forward-compatible. Existing message history is preserved.
 ## Requirements
 
 - Python >= 3.11
+- `mcp` >= 2.0.0
 - Claude Code v2.1.80 or later (channels support)
 - `uv` for managing the venv and running
 
@@ -353,6 +480,7 @@ The DB schema is forward-compatible. Existing message history is preserved.
 
 - **Source**: https://github.com/struktured-labs/session-intercom
 - **Plugin**: [`struktured-labs/claudemarketplace`](https://github.com/struktured-labs/claudemarketplace), `plugins/session-intercom/`
+- **Per-harness setup**: [docs/CLIENTS.md](docs/CLIENTS.md)
 - **Channels API docs**: https://code.claude.com/docs/en/channels-reference
 - **Tracking issue that drove channels into the CLI**: https://github.com/anthropics/claude-code/issues/33679
 

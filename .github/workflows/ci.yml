@@ -72,3 +72,48 @@ jobs:
 
       - name: Run ruff format check
         run: uv run ruff format --check .
+
+  smoke:
+    name: stdio smoke (server actually starts + serves tools)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      # Resolve fresh, not from the lockfile: #7 was an SDK release breaking us
+      # at import in newly created envs while every cached env kept working.
+      # This job is the canary for that class of failure.
+      - name: Install with a fresh resolution
+        run: uv sync --extra dev --upgrade
+
+      - name: Report resolved mcp version
+        run: uv run python -c "from importlib.metadata import version; print('mcp', version('mcp'))"
+
+      - name: Handshake over stdio and assert the tool surface
+        run: |
+          { printf '%s\n' \
+            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"1"}}}' \
+            '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+            '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'; sleep 3; } \
+          | timeout 60 uv run python -m session_intercom.server 2>/dev/null > frames.jsonl
+          uv run python - <<'PY'
+          import json, sys
+          frames = [json.loads(l) for l in open("frames.jsonl") if l.strip()]
+          init = next((f for f in frames if f.get("id") == 1), None)
+          tools = next((f for f in frames if f.get("id") == 2), None)
+          assert init, f"no initialize response; got {frames}"
+          exp = init["result"]["capabilities"].get("experimental") or {}
+          assert "claude/channel" in exp, f"claude/channel capability missing: {exp}"
+          assert tools, f"no tools/list response; got {frames}"
+          names = [t["name"] for t in tools["result"]["tools"]]
+          assert "intercom_register" in names, names
+          assert len(names) >= 11, f"expected the full surface, got {len(names)}: {names}"
+          print(f"OK: handshake clean, claude/channel declared, {len(names)} tools served")
+          PY
