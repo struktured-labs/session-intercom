@@ -191,15 +191,57 @@ args = ["--from", "git+https://github.com/struktured-labs/session-intercom@main"
 
 ### How a non-channels client receives
 
-Clients without a channel-notification concept ignore the `notifications/claude/channel` frames (unknown method, harmlessly dropped) and read on their own schedule instead. The move that works well:
+Clients with no channel-notification concept drop the `notifications/claude/channel` frames as an unknown method and read on their own turns instead. The observed pattern, from a real Codex transcript:
 
-```python
-intercom_history(name="my-session", with_session="the-other-agent", limit=3)
+```
+22:31:38  intercom_register   {'name':'codex-penta-dx', 'backlog':0, ...}
+22:33:50  intercom_send       -> penta-dragon-dx-claude
+22:34:00  intercom_history    {'with_session':'penta-dragon-dx-claude','limit':6}
+22:35:08  intercom_broadcast  channel='penta-dragon-dx'
+22:35:52  intercom_history    limit:5
+22:39:03  intercom_send
+...
+23:20:06  intercom_history    limit:3
 ```
 
-**Use `intercom_history`, not `intercom_poll`, for this.** History is read-only — it doesn't advance any cursor, so an agent can re-read as often as its loop wants without consuming anything or racing the tailer. `intercom_poll` *does* consume, which makes it the wrong primitive for a polling loop you might run twice.
+Two things to copy from it:
+
+**Read with `intercom_history`, never `intercom_poll`.** Every read in that transcript is `intercom_history(name=..., with_session=..., limit=3..6)`; there is not a single `poll` call. History is non-consuming, so an agent loop can re-read as often as it likes — twice in twelve seconds, as happened at 23:01:58 and 23:02:10 — without consuming anything or racing the tailer. `intercom_poll` *does* consume, which makes it the wrong primitive for a loop that may fire more than once per exchange. The cursor table confirms the shape: that session has no per-sender DM cursors at all.
+
+**Register with `backlog=0` if the client has no push.** Nothing will replay those messages into context, so a backlog only spends context on history the agent is about to re-read anyway.
 
 Sending is identical everywhere: `intercom_send(to_name=..., body=...)`.
+
+There is no polling *interval* — reads happen on whatever turns the host harness generates. In the Codex case those are autonomous goal-loop turns (`<codex_internal_context source="goal">`), and the gaps ranged from 10 seconds to 14 minutes.
+
+### If the client can't load an MCP server config
+
+Worth knowing because it is what actually happened above: a long-running session that predates the config edit never loads the new server. Codex worked around it by driving session-intercom as a subprocess from a scratch MCP client, which works from any language with an MCP SDK:
+
+```python
+# uv run --with mcp python - <<'PY'
+import asyncio
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+
+async def main():
+    p = StdioServerParameters(
+        command="uvx",
+        args=["--from", "git+https://github.com/struktured-labs/session-intercom@main",
+              "session-intercom"],
+    )
+    async with stdio_client(p) as (r, w):
+        async with ClientSession(r, w) as s:
+            await s.initialize()
+            out = await s.call_tool("intercom_history",
+                                    {"name": "me", "with_session": "them", "limit": 3})
+            for c in out.content:
+                print(getattr(c, "text", c))
+
+asyncio.run(main())
+```
+
+Each invocation is a fresh process and a fresh registration-free read — the session row already exists in SQLite, so only `intercom_register` needs calling once.
 
 ### What this means for the design
 
