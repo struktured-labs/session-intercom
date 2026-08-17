@@ -175,6 +175,8 @@ Also worth doing: truncate individual notification bodies (we cap at 2000 chars 
 
 ## Using it from other MCP clients (Codex, etc.)
 
+> Per-harness config for Codex, Cursor, OpenCode, Grok, Pi, Letta and Claude Code lives in **[docs/CLIENTS.md](docs/CLIENTS.md)**. This section covers why it works at all.
+
 The channels push is a **Claude Code optimization, not the delivery mechanism**. The tool surface is plain MCP, so any client can drive session-intercom — and agents on different harnesses can talk to each other through the same SQLite bus.
 
 Verified in production: a Codex (`gpt-5.6-sol`) session and a Claude Code session held a sustained bidirectional conversation, trading messages every 1–2 minutes.
@@ -478,6 +480,7 @@ The DB schema is forward-compatible. Existing message history is preserved.
 
 - **Source**: https://github.com/struktured-labs/session-intercom
 - **Plugin**: [`struktured-labs/claudemarketplace`](https://github.com/struktured-labs/claudemarketplace), `plugins/session-intercom/`
+- **Per-harness setup**: [docs/CLIENTS.md](docs/CLIENTS.md)
 - **Channels API docs**: https://code.claude.com/docs/en/channels-reference
 - **Tracking issue that drove channels into the CLI**: https://github.com/anthropics/claude-code/issues/33679
 
