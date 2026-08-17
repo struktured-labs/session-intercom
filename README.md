@@ -173,6 +173,48 @@ Also worth doing: truncate individual notification bodies (we cap at 2000 chars 
 
 ---
 
+## Using it from other MCP clients (Codex, etc.)
+
+The channels push is a **Claude Code optimization, not the delivery mechanism**. The tool surface is plain MCP, so any client can drive session-intercom — and agents on different harnesses can talk to each other through the same SQLite bus.
+
+Verified in production: a Codex (`gpt-5.6-sol`) session and a Claude Code session held a sustained bidirectional conversation, trading messages every 1–2 minutes.
+
+### Codex setup
+
+`~/.codex/config.toml`:
+
+```toml
+[mcp_servers.session-intercom]
+command = "uvx"
+args = ["--from", "git+https://github.com/struktured-labs/session-intercom@main", "session-intercom"]
+```
+
+### How a non-channels client receives
+
+Clients without a channel-notification concept ignore the `notifications/claude/channel` frames (unknown method, harmlessly dropped) and read on their own schedule instead. The move that works well:
+
+```python
+intercom_history(name="my-session", with_session="the-other-agent", limit=3)
+```
+
+**Use `intercom_history`, not `intercom_poll`, for this.** History is read-only — it doesn't advance any cursor, so an agent can re-read as often as its loop wants without consuming anything or racing the tailer. `intercom_poll` *does* consume, which makes it the wrong primitive for a polling loop you might run twice.
+
+Sending is identical everywhere: `intercom_send(to_name=..., body=...)`.
+
+### What this means for the design
+
+Delivery is layered, and each layer degrades independently:
+
+| Layer | Mechanism | Client support |
+|-------|-----------|----------------|
+| Storage | SQLite, monotonic message ids, per-source cursors | universal |
+| Read | `intercom_history` (non-consuming) / `intercom_poll` (consuming) | any MCP client |
+| Push | `notifications/claude/channel` → `<channel>` tags | Claude Code only |
+
+Only the push layer is Claude-specific, and losing it costs latency, not messages. That is also why the [cursor split](#5-use-a-separate-cursor-for-the-tailer--critical) matters: the tailer running against a client that ignores its notifications must not consume anything the read layer still owes the agent.
+
+---
+
 ## Quick start (user perspective)
 
 ### Install via plugin
@@ -348,6 +390,28 @@ uv run --extra dev pytest tests/ -v
 ```
 
 49 tests cover: idempotent registration, heartbeat refresh, FK-safe cleanup, cursor-split semantics, backlog capping, subscription gating, MCP tool dispatch, SDK handler registration, the JSON-RPC wire format we emit, and meta-key sanitization.
+
+## Upgrading to 0.8.0 (mcp 2.x)
+
+0.8.0 requires `mcp>=2.0.0`. If you added `--with "mcp<2"` anywhere as a workaround for the 1.x→2.0 break (that pin was the right call while the server was on the 1.x API), **remove it** — the constraint is now unsatisfiable and `uvx` will refuse to resolve:
+
+```
+× No solution found when resolving tool dependencies:
+╰─▶ session-intercom==0.8.0 depends on mcp>=2.0.0
+    And because you require session-intercom and mcp<2, we can conclude that
+    your requirements are unsatisfiable.
+```
+
+Check any MCP client config that names session-intercom:
+
+```toml
+# before
+args = ["--with", "mcp<2", "--from", "git+https://github.com/struktured-labs/session-intercom@main", "session-intercom"]
+# after
+args = ["--from", "git+https://github.com/struktured-labs/session-intercom@main", "session-intercom"]
+```
+
+The failure is loud (resolution error at spawn), not silent — the server just won't start.
 
 ## Migration from 0.5.x (file-inbox era)
 
