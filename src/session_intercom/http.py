@@ -22,11 +22,10 @@ import logging
 import os
 
 import uvicorn
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse
-from starlette.routing import Mount, Route
-
-from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+from starlette.routing import Route
 
 from . import db, server
 
@@ -56,7 +55,7 @@ async def _seed_channel_cursors(identity: str) -> None:
         await conn.close()
 
 
-def build_app(identity: str, token: str) -> Starlette:
+def build_app(identity: str, token: str):
     manager = StreamableHTTPSessionManager(app=server.server, json_response=True, stateless=True)
     expected = f"Bearer {token}".encode()
 
@@ -81,10 +80,17 @@ def build_app(identity: str, token: str) -> Starlette:
         async with manager.run():
             yield
 
-    return Starlette(
-        routes=[Route("/health", health), Mount("/mcp", app=mcp_asgi)],
-        lifespan=lifespan,
-    )
+    inner = Starlette(routes=[Route("/health", health)], lifespan=lifespan)
+
+    async def app(scope, receive, send):
+        # Serve MCP at /mcp and /mcp/ alike (no 307 slash redirect, which
+        # breaks POSTs behind proxies like Tailscale Funnel).
+        if scope["type"] == "http" and scope["path"].rstrip("/") == "/mcp":
+            await mcp_asgi(scope, receive, send)
+        else:
+            await inner(scope, receive, send)
+
+    return app
 
 
 def main() -> None:
