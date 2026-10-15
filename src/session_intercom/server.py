@@ -32,7 +32,7 @@ from mcp.types import JSONRPCNotification
 
 from . import db
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 
 logger = logging.getLogger("session-intercom")
 
@@ -58,6 +58,43 @@ def _resolve_name(provided: str | None) -> str:
 
 def _ok(data: dict[str, Any]) -> list[types.TextContent]:
     return [types.TextContent(type="text", text=json.dumps(data, indent=2, default=str))]
+
+
+def _ok_compact(data: dict[str, Any]) -> list[types.TextContent]:
+    return [
+        types.TextContent(type="text", text=json.dumps(data, separators=(",", ":"), default=str))
+    ]
+
+
+def _fmt_messages(
+    messages: list[Any], remaining: int, max_chars: int, verbose: bool
+) -> list[types.TextContent]:
+    if verbose:
+        return _ok(
+            {
+                "messages": [asdict(m) for m in messages],
+                "count": len(messages),
+                "remaining": remaining,
+            }
+        )
+    out: list[dict[str, Any]] = []
+    for m in messages:
+        body = m.body
+        if max_chars and len(body) > max_chars:
+            body = (
+                body[:max_chars]
+                + f"…[+{len(body) - max_chars} chars; intercom_history(thread_id={m.id})]"
+            )
+        item: dict[str, Any] = {"id": m.id, "from": m.sender_name, "body": body}
+        if m.channel:
+            item["ch"] = m.channel
+        if m.thread_id:
+            item["t"] = m.thread_id
+        out.append(item)
+    data: dict[str, Any] = {"m": out}
+    if remaining:
+        data["more"] = remaining
+    return _ok_compact(data)
 
 
 def _err(msg: str) -> list[types.TextContent]:
@@ -159,19 +196,65 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="intercom_poll",
             description=(
-                "Drain unread messages using the per-sender / per-channel cursors. "
-                "Independent from channel-notification delivery: if the host wasn't "
-                "launched with `--dangerously-load-development-channels server:session-intercom` "
-                "(or channels otherwise silently fail), this is the recovery path — the "
-                "tailer's cursor is separate and won't have advanced these cursors."
+                "Read unread messages (DMs only unless include_channels) and mark them "
+                'read. Compact output; empty result is {"m":[]}. Recovery path when '
+                "<channel> push delivery is unavailable."
             ),
             input_schema={
                 "type": "object",
                 "properties": {
                     "name": {"type": ["string", "null"]},
+                    "include_channels": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Also return broadcasts (default: DMs only).",
+                    },
+                    "limit": {"type": "integer", "default": 20},
+                    "max_chars": {
+                        "type": "integer",
+                        "default": 2000,
+                        "description": "Truncate each body to this many chars.",
+                    },
+                    "verbose": {"type": "boolean", "default": False},
                     "mark_read": {"type": "boolean", "default": True},
-                    "limit": {"type": "integer", "default": 50},
-                    "channel": {"type": ["string", "null"]},
+                    "channel": {"type": ["string", "null"], "description": "Only this channel."},
+                },
+            },
+        ),
+        types.Tool(
+            name="intercom_wait",
+            description=(
+                "Block up to timeout_s seconds (max 55) until an unread message arrives, "
+                "then return it like intercom_poll. Cheapest way to await a reply."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "timeout_s": {"type": "integer", "default": 30},
+                    "name": {"type": ["string", "null"]},
+                    "include_channels": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Also return broadcasts (default: DMs only).",
+                    },
+                    "limit": {"type": "integer", "default": 20},
+                    "max_chars": {
+                        "type": "integer",
+                        "default": 2000,
+                        "description": "Truncate each body to this many chars.",
+                    },
+                    "verbose": {"type": "boolean", "default": False},
+                },
+            },
+        ),
+        types.Tool(
+            name="intercom_unread",
+            description="Unread counts {dm, ch} without reading or marking anything.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "name": {"type": ["string", "null"]},
+                    "include_channels": {"type": "boolean", "default": False},
                 },
             },
         ),
@@ -237,8 +320,10 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
     global _current_session
     if _locked_identity is not None:
         for key in ("name", "from_name"):
-            if key in arguments and arguments[key] not in (None, "", _locked_identity) and not (
-                name in ("intercom_history", "intercom_create_channel")
+            if (
+                key in arguments
+                and arguments[key] not in (None, "", _locked_identity)
+                and name not in ("intercom_history", "intercom_create_channel")
             ):
                 return _err(f"this endpoint is locked to identity '{_locked_identity}'")
     try:
@@ -306,20 +391,35 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
             )
             return _ok({"messages": [asdict(m) for m in messages], "count": len(messages)})
 
-        if name == "intercom_poll":
+        if name in ("intercom_poll", "intercom_wait"):
             session_name = _resolve_name(arguments.get("name"))
+            incl = bool(arguments.get("include_channels", False))
+            limit = arguments.get("limit", 20)
+            mark_read = arguments.get("mark_read", True)
+            channel = arguments.get("channel")
+            if name == "intercom_wait":
+                deadline = anyio.current_time() + max(
+                    0, min(int(arguments.get("timeout_s", 30)), 55)
+                )
+                while True:
+                    counts = await db.unread_counts(session_name, incl)
+                    if sum(counts.values()) or anyio.current_time() >= deadline:
+                        break
+                    await anyio.sleep(1.0)
             messages, remaining = await db.poll_messages(
-                session_name,
-                arguments.get("mark_read", True),
-                arguments.get("limit", 50),
-                arguments.get("channel"),
+                session_name, mark_read, limit, channel, include_channels=incl or bool(channel)
             )
-            return _ok(
-                {
-                    "messages": [asdict(m) for m in messages],
-                    "count": len(messages),
-                    "remaining": remaining,
-                }
+            return _fmt_messages(
+                messages,
+                remaining,
+                arguments.get("max_chars", 2000),
+                arguments.get("verbose", False),
+            )
+
+        if name == "intercom_unread":
+            session_name = _resolve_name(arguments.get("name"))
+            return _ok_compact(
+                await db.unread_counts(session_name, bool(arguments.get("include_channels", False)))
             )
 
         if name == "intercom_subscribe":
