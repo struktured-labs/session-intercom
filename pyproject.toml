@@ -18,6 +18,7 @@ dev = [
 
 [project.scripts]
 session-intercom = "session_intercom.server:main"
+session-intercom-http = "session_intercom.http:main"
 
 [build-system]
 requires = ["hatchling"]
