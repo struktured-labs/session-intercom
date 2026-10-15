@@ -33,6 +33,29 @@ from . import db, server
 logger = logging.getLogger("session-intercom.http")
 
 
+async def _seed_channel_cursors(identity: str) -> None:
+    """Start intercom_poll at "now" for channel broadcasts this identity has
+    never read, instead of replaying the full channel history (thousands of
+    messages). Existing cursors and DM cursors are untouched."""
+    from .db._common import get_connection
+
+    conn = await get_connection()
+    try:
+        await conn.execute(
+            """
+            INSERT OR IGNORE INTO read_cursors (session_id, source, last_read_id)
+            SELECT s.id, 'ch:' || m.channel, MAX(m.id)
+            FROM sessions s, messages m
+            WHERE s.name = ? AND m.channel IS NOT NULL
+            GROUP BY m.channel
+            """,
+            (identity,),
+        )
+        await conn.commit()
+    finally:
+        await conn.close()
+
+
 def build_app(identity: str, token: str) -> Starlette:
     manager = StreamableHTTPSessionManager(app=server.server, json_response=True, stateless=True)
     expected = f"Bearer {token}".encode()
@@ -53,6 +76,7 @@ def build_app(identity: str, token: str) -> Starlette:
         await db.init_db()
         res = await server.call_tool("intercom_register", {"name": identity, "backlog": 0})
         server._locked_identity = identity
+        await _seed_channel_cursors(identity)
         logger.info("registered %s: %s", identity, json.loads(res[0].text).get("status"))
         async with manager.run():
             yield
