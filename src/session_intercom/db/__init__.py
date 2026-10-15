@@ -40,6 +40,7 @@ from .messages import (
     init_tailer_cursor,
     poll_messages,
     send_message,
+    unread_counts,
 )
 from .sessions import (
     get_session_by_name,
@@ -102,6 +103,7 @@ __all__ = [
     "get_session_by_name",
     # messages
     "send_message",
+    "unread_counts",
     "broadcast_message",
     "poll_messages",
     "get_history",

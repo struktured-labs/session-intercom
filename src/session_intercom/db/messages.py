@@ -103,7 +103,11 @@ async def broadcast_message(
 
 
 async def poll_messages(
-    name: str, mark_read: bool = True, limit: int = 50, channel: str | None = None
+    name: str,
+    mark_read: bool = True,
+    limit: int = 50,
+    channel: str | None = None,
+    include_channels: bool = True,
 ) -> tuple[list[Message], int]:
     limit = min(max(limit, 1), 200)
     db = await get_connection()
@@ -122,7 +126,8 @@ async def poll_messages(
             messages.extend(await _poll_channel(db, session_id, channel, limit))
         else:
             messages.extend(await _poll_dms(db, session_id, limit))
-            messages.extend(await _poll_all_channels(db, session_id, limit))
+            if include_channels:
+                messages.extend(await _poll_all_channels(db, session_id, limit))
 
         # Sort by id (monotonic order) and apply limit
         messages.sort(key=lambda m: m.id)
@@ -134,6 +139,36 @@ async def poll_messages(
 
         await db.commit()
         return result, remaining
+    finally:
+        await db.close()
+
+
+async def unread_counts(name: str, include_channels: bool = True) -> dict[str, int]:
+    """Cheap unread counts against the poll cursors (does not advance them)."""
+    db = await get_connection()
+    try:
+        session_id = (await get_session_by_name(db, name))["id"]
+        dm = (
+            await db.execute_fetchall(
+                """SELECT COUNT(*) AS n FROM messages m
+                WHERE m.recipient_id = ? AND m.channel IS NULL AND m.id > COALESCE(
+                  (SELECT last_read_id FROM read_cursors
+                   WHERE session_id = ? AND source = m.sender_id), 0)""",
+                (session_id, session_id),
+            )
+        )[0]["n"]
+        out = {"dm": dm}
+        if include_channels:
+            out["ch"] = (
+                await db.execute_fetchall(
+                    """SELECT COUNT(*) AS n FROM messages m
+                    WHERE m.channel IS NOT NULL AND m.sender_id != ? AND m.id > COALESCE(
+                      (SELECT last_read_id FROM read_cursors
+                       WHERE session_id = ? AND source = 'ch:' || m.channel), 0)""",
+                    (session_id, session_id),
+                )
+            )[0]["n"]
+        return out
     finally:
         await db.close()
 

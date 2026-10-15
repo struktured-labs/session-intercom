@@ -28,11 +28,11 @@ from mcp.server.lowlevel import NotificationOptions, Server
 from mcp.server.models import InitializationOptions
 from mcp.server.stdio import stdio_server
 from mcp.shared.message import SessionMessage
-from mcp.types import JSONRPCMessage, JSONRPCNotification
+from mcp.types import JSONRPCNotification
 
 from . import db
 
-__version__ = "0.7.0"
+__version__ = "0.9.0"
 
 logger = logging.getLogger("session-intercom")
 
@@ -40,6 +40,9 @@ logger = logging.getLogger("session-intercom")
 _current_session: str | None = None
 # Set once on register; the tailer waits on this before polling.
 _tailer_ready = anyio.Event()
+# Set by the HTTP front end: identity is fixed; register/from_name/name may not
+# impersonate another session.
+_locked_identity: str | None = None
 
 
 def _resolve_name(provided: str | None) -> str:
@@ -57,6 +60,43 @@ def _ok(data: dict[str, Any]) -> list[types.TextContent]:
     return [types.TextContent(type="text", text=json.dumps(data, indent=2, default=str))]
 
 
+def _ok_compact(data: dict[str, Any]) -> list[types.TextContent]:
+    return [
+        types.TextContent(type="text", text=json.dumps(data, separators=(",", ":"), default=str))
+    ]
+
+
+def _fmt_messages(
+    messages: list[Any], remaining: int, max_chars: int, verbose: bool
+) -> list[types.TextContent]:
+    if verbose:
+        return _ok(
+            {
+                "messages": [asdict(m) for m in messages],
+                "count": len(messages),
+                "remaining": remaining,
+            }
+        )
+    out: list[dict[str, Any]] = []
+    for m in messages:
+        body = m.body
+        if max_chars and len(body) > max_chars:
+            body = (
+                body[:max_chars]
+                + f"…[+{len(body) - max_chars} chars; intercom_history(thread_id={m.id})]"
+            )
+        item: dict[str, Any] = {"id": m.id, "from": m.sender_name, "body": body}
+        if m.channel:
+            item["ch"] = m.channel
+        if m.thread_id:
+            item["t"] = m.thread_id
+        out.append(item)
+    data: dict[str, Any] = {"m": out}
+    if remaining:
+        data["more"] = remaining
+    return _ok_compact(data)
+
+
 def _err(msg: str) -> list[types.TextContent]:
     return [types.TextContent(type="text", text=json.dumps({"error": msg}))]
 
@@ -66,7 +106,6 @@ def _err(msg: str) -> list[types.TextContent]:
 server: Server = Server("session-intercom")
 
 
-@server.list_tools()
 async def list_tools() -> list[types.Tool]:
     return [
         types.Tool(
@@ -78,7 +117,7 @@ async def list_tools() -> list[types.Tool]:
                 "push — no polling, no file inbox. Auto-subscribes to the 'general' "
                 "channel; manage with intercom_subscribe / intercom_unsubscribe."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "name": {
@@ -106,7 +145,7 @@ async def list_tools() -> list[types.Tool]:
                 "Send a direct message. Recipient sees it as a <channel> tag on their "
                 "next turn. from_name defaults to your registered name."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "to_name": {"type": "string"},
@@ -120,7 +159,7 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="intercom_broadcast",
             description="Broadcast to a channel (default: 'general'). from_name defaults to your registered session.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "body": {"type": "string"},
@@ -134,7 +173,7 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="intercom_list_sessions",
             description="List all registered sessions.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {"include_stale": {"type": "boolean", "default": False}},
             },
@@ -142,7 +181,7 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="intercom_history",
             description="Retrieve message history (read-only — does not advance cursors).",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "with_session": {"type": ["string", "null"]},
@@ -157,19 +196,65 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="intercom_poll",
             description=(
-                "Drain unread messages using the per-sender / per-channel cursors. "
-                "Independent from channel-notification delivery: if the host wasn't "
-                "launched with `--dangerously-load-development-channels server:session-intercom` "
-                "(or channels otherwise silently fail), this is the recovery path — the "
-                "tailer's cursor is separate and won't have advanced these cursors."
+                "Read unread messages (DMs only unless include_channels) and mark them "
+                'read. Compact output; empty result is {"m":[]}. Recovery path when '
+                "<channel> push delivery is unavailable."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "name": {"type": ["string", "null"]},
+                    "include_channels": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Also return broadcasts (default: DMs only).",
+                    },
+                    "limit": {"type": "integer", "default": 20},
+                    "max_chars": {
+                        "type": "integer",
+                        "default": 2000,
+                        "description": "Truncate each body to this many chars.",
+                    },
+                    "verbose": {"type": "boolean", "default": False},
                     "mark_read": {"type": "boolean", "default": True},
-                    "limit": {"type": "integer", "default": 50},
-                    "channel": {"type": ["string", "null"]},
+                    "channel": {"type": ["string", "null"], "description": "Only this channel."},
+                },
+            },
+        ),
+        types.Tool(
+            name="intercom_wait",
+            description=(
+                "Block up to timeout_s seconds (max 55) until an unread message arrives, "
+                "then return it like intercom_poll. Cheapest way to await a reply."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "timeout_s": {"type": "integer", "default": 30},
+                    "name": {"type": ["string", "null"]},
+                    "include_channels": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Also return broadcasts (default: DMs only).",
+                    },
+                    "limit": {"type": "integer", "default": 20},
+                    "max_chars": {
+                        "type": "integer",
+                        "default": 2000,
+                        "description": "Truncate each body to this many chars.",
+                    },
+                    "verbose": {"type": "boolean", "default": False},
+                },
+            },
+        ),
+        types.Tool(
+            name="intercom_unread",
+            description="Unread counts {dm, ch} without reading or marking anything.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "name": {"type": ["string", "null"]},
+                    "include_channels": {"type": "boolean", "default": False},
                 },
             },
         ),
@@ -179,7 +264,7 @@ async def list_tools() -> list[types.Tool]:
                 "Subscribe to a broadcast channel so its messages reach you as "
                 "<channel> tags. DMs always arrive regardless of subscriptions."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "channel": {"type": "string"},
@@ -194,7 +279,7 @@ async def list_tools() -> list[types.Tool]:
                 "Stop receiving a broadcast channel. Cuts context noise from busy "
                 "channels you don't need. DMs are unaffected."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "channel": {"type": "string"},
@@ -206,12 +291,12 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="intercom_list_channels",
             description="List available broadcast channels.",
-            inputSchema={"type": "object", "properties": {}},
+            input_schema={"type": "object", "properties": {}},
         ),
         types.Tool(
             name="intercom_create_channel",
             description="Create a new broadcast channel.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "channel_name": {"type": "string"},
@@ -223,7 +308,7 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="intercom_cleanup",
             description="Remove sessions inactive for ttl_minutes (default: 2 weeks).",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {"ttl_minutes": {"type": "integer", "default": db.CLEANUP_MINUTES}},
             },
@@ -231,9 +316,16 @@ async def list_tools() -> list[types.Tool]:
     ]
 
 
-@server.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextContent]:
     global _current_session
+    if _locked_identity is not None:
+        for key in ("name", "from_name"):
+            if (
+                key in arguments
+                and arguments[key] not in (None, "", _locked_identity)
+                and name not in ("intercom_history", "intercom_create_channel")
+            ):
+                return _err(f"this endpoint is locked to identity '{_locked_identity}'")
     try:
         if name == "intercom_register":
             session = await db.register_session(arguments["name"], arguments.get("metadata"), None)
@@ -299,20 +391,35 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
             )
             return _ok({"messages": [asdict(m) for m in messages], "count": len(messages)})
 
-        if name == "intercom_poll":
+        if name in ("intercom_poll", "intercom_wait"):
             session_name = _resolve_name(arguments.get("name"))
+            incl = bool(arguments.get("include_channels", False))
+            limit = arguments.get("limit", 20)
+            mark_read = arguments.get("mark_read", True)
+            channel = arguments.get("channel")
+            if name == "intercom_wait":
+                deadline = anyio.current_time() + max(
+                    0, min(int(arguments.get("timeout_s", 30)), 55)
+                )
+                while True:
+                    counts = await db.unread_counts(session_name, incl)
+                    if sum(counts.values()) or anyio.current_time() >= deadline:
+                        break
+                    await anyio.sleep(1.0)
             messages, remaining = await db.poll_messages(
-                session_name,
-                arguments.get("mark_read", True),
-                arguments.get("limit", 50),
-                arguments.get("channel"),
+                session_name, mark_read, limit, channel, include_channels=incl or bool(channel)
             )
-            return _ok(
-                {
-                    "messages": [asdict(m) for m in messages],
-                    "count": len(messages),
-                    "remaining": remaining,
-                }
+            return _fmt_messages(
+                messages,
+                remaining,
+                arguments.get("max_chars", 2000),
+                arguments.get("verbose", False),
+            )
+
+        if name == "intercom_unread":
+            session_name = _resolve_name(arguments.get("name"))
+            return _ok_compact(
+                await db.unread_counts(session_name, bool(arguments.get("include_channels", False)))
             )
 
         if name == "intercom_subscribe":
@@ -360,6 +467,30 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
         return _err(str(e))
 
 
+# --- Handler registration (mcp >= 2 imperative API) ---
+#
+# mcp 2.0 dropped the @server.list_tools() / @server.call_tool() decorators for
+# add_request_handler(method, params_type, handler). Handlers receive a
+# ServerRequestContext plus a validated params model (never None — absent
+# `params` validates as {}). The thin adapters below keep list_tools/call_tool
+# as plain callables so tests can drive them directly.
+
+
+async def _handle_list_tools(
+    ctx: Any, params: types.PaginatedRequestParams
+) -> types.ListToolsResult:
+    return types.ListToolsResult(tools=await list_tools())
+
+
+async def _handle_call_tool(ctx: Any, params: types.CallToolRequestParams) -> types.CallToolResult:
+    content: list[types.ContentBlock] = list(await call_tool(params.name, params.arguments or {}))
+    return types.CallToolResult(content=content)
+
+
+server.add_request_handler("tools/list", types.PaginatedRequestParams, _handle_list_tools)
+server.add_request_handler("tools/call", types.CallToolRequestParams, _handle_call_tool)
+
+
 # --- Tailer: push new messages as channel notifications ---
 
 
@@ -370,13 +501,19 @@ async def _emit_channel(write_stream: Any, content: str, meta: dict[str, str]) -
     typed model for this Claude-specific method. The wire format is standard
     JSON-RPC 2.0; we hand-construct JSONRPCNotification and push it on the
     same stream Claude Code is reading on.
+
+    Writing straight to the transport is also why the 2.x move to
+    `subscriptions/listen` for change notifications doesn't affect us — that
+    governs the SDK's own notification helpers, not raw frames. stdio_server
+    serializes whatever `SessionMessage.message` holds; in 2.x JSONRPCMessage
+    is a plain type union, so the notification goes in unwrapped.
     """
     notification = JSONRPCNotification(
         jsonrpc="2.0",
         method="notifications/claude/channel",
         params={"content": content, "meta": meta},
     )
-    await write_stream.send(SessionMessage(message=JSONRPCMessage(notification)))
+    await write_stream.send(SessionMessage(message=notification))
 
 
 def _truncate_for_notification(body: str, message_id: int) -> str:

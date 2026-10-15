@@ -70,6 +70,14 @@ async def register_session(
             (session_id, name, now, now, metadata, team_name),
         )
         await _ensure_default_subscription(db, session_id)
+        # A brand-new identity starts its channel poll cursors at "now" so the
+        # first intercom_poll doesn't replay the entire broadcast history.
+        await db.execute(
+            "INSERT OR IGNORE INTO read_cursors (session_id, source, last_read_id) "
+            "SELECT ?, 'ch:' || channel, MAX(id) FROM messages "
+            "WHERE channel IS NOT NULL GROUP BY channel",
+            (session_id,),
+        )
         await db.commit()
         return Session(
             id=session_id,

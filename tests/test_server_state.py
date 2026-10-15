@@ -130,8 +130,9 @@ async def test_poll_uses_registered_name_implicitly():
 
     result = _payload(await server.call_tool("intercom_poll", {}))
 
-    assert result["count"] == 1
-    assert result["messages"][0]["body"] == "msg"
+    assert result == {"m": [{"id": result["m"][0]["id"], "from": "bob", "body": "msg"}]}
+    verbose = _payload(await server.call_tool("intercom_poll", {"verbose": True}))
+    assert verbose["count"] == 0
 
 
 # --- Cleanup uses the durable constant by default ---
@@ -213,3 +214,124 @@ def test_meta_safe_drops_none_and_non_identifier_keys():
         }
     )
     assert out == {"from": "alice", "message_id": "42", "channel": "general"}
+
+
+# --- SDK-contract regressions (would have caught the mcp 2.0 break, see #7/#8) ---
+
+
+def test_tools_handlers_are_registered_on_the_server():
+    """Handler registration must survive SDK API changes.
+
+    mcp 2.0 dropped the @server.list_tools()/@server.call_tool() decorators for
+    add_request_handler(). Under 1.x the decorators registered handlers at
+    import; if a future SDK moves the goalposts again, the decorators silently
+    become no-ops and the server starts but serves zero tools. Assert the
+    handlers are actually wired.
+    """
+    assert server.server.get_request_handler("tools/list") is not None
+    assert server.server.get_request_handler("tools/call") is not None
+
+
+@pytest.mark.asyncio
+async def test_list_tools_handler_returns_every_advertised_tool():
+    """The registered tools/list handler must return the full surface.
+
+    Exercises the adapter, not just the inner coroutine — a broken params_type
+    or result-model contract shows up here rather than at session startup.
+    """
+    import mcp.types as types
+
+    result = await server._handle_list_tools(None, types.PaginatedRequestParams())
+    names = {t.name for t in result.tools}
+    assert names == {t.name for t in await server.list_tools()}
+    assert "intercom_register" in names
+    assert "intercom_send" in names
+    assert "intercom_subscribe" in names
+
+
+@pytest.mark.asyncio
+async def test_call_tool_handler_dispatches_through_adapter():
+    """The registered tools/call handler must reach the tool body and wrap the
+    result in the SDK's result model."""
+    import mcp.types as types
+
+    await db.init_db()
+    params = types.CallToolRequestParams(name="intercom_register", arguments={"name": "alice"})
+    result = await server._handle_call_tool(None, params)
+
+    assert isinstance(result, types.CallToolResult)
+    block = result.content[0]
+    assert isinstance(block, types.TextContent), f"expected TextContent, got {type(block)}"
+    payload = json.loads(block.text)
+    assert payload["status"] == "registered"
+    assert server._current_session == "alice"
+
+
+@pytest.mark.asyncio
+async def test_emit_channel_survives_the_transport_serialization_path():
+    """Serialize exactly the way stdio_server does, so a change in how the SDK
+    models JSON-RPC frames fails here instead of in production.
+
+    mcp 2.0 turned JSONRPCMessage from a RootModel wrapper into a plain type
+    union, so the old `JSONRPCMessage(notification)` call raised TypeError at
+    runtime — in the channel-delivery hot path, invisible to import-time checks.
+    """
+    captured: list = []
+
+    class FakeStream:
+        async def send(self, msg):
+            captured.append(msg)
+
+    await server._emit_channel(FakeStream(), "body text", {"from": "alice"})
+
+    # This is stdio_server's write loop, verbatim.
+    wire = captured[0].message.model_dump_json(by_alias=True, exclude_unset=True)
+    frame = json.loads(wire)
+    assert frame == {
+        "jsonrpc": "2.0",
+        "method": "notifications/claude/channel",
+        "params": {"content": "body text", "meta": {"from": "alice"}},
+    }
+
+
+# --- Token-efficient read path ---
+
+
+@pytest.mark.asyncio
+async def test_poll_dm_only_by_default_and_no_backlog_for_new_identity():
+    await db.init_db()
+    await server.call_tool("intercom_register", {"name": "old"})
+    await server.call_tool("intercom_broadcast", {"body": "ancient", "from_name": "old"})
+    await server.call_tool("intercom_register", {"name": "fresh"})
+    # New identity: channel cursors start at now, so nothing replays.
+    r = _payload(await server.call_tool("intercom_poll", {"include_channels": True}))
+    assert r == {"m": []}
+    await server.call_tool("intercom_broadcast", {"body": "new bc", "from_name": "old"})
+    await server.call_tool("intercom_send", {"to_name": "fresh", "body": "dm", "from_name": "old"})
+    assert _payload(await server.call_tool("intercom_unread", {"include_channels": True})) == {
+        "dm": 1,
+        "ch": 1,
+    }
+    r = _payload(await server.call_tool("intercom_poll", {}))
+    assert [m["body"] for m in r["m"]] == ["dm"]
+    r = _payload(await server.call_tool("intercom_poll", {"include_channels": True}))
+    assert [(m["body"], m["ch"]) for m in r["m"]] == [("new bc", "general")]
+
+
+@pytest.mark.asyncio
+async def test_wait_times_out_empty_and_returns_on_arrival():
+    import anyio
+
+    await db.init_db()
+    await server.call_tool("intercom_register", {"name": "a"})
+    await server.call_tool("intercom_register", {"name": "w"})
+    assert _payload(await server.call_tool("intercom_wait", {"timeout_s": 1})) == {"m": []}
+
+    async def later():
+        await anyio.sleep(1.2)
+        await db.send_message("a", "w", "x" * 50)
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(later)
+        r = _payload(await server.call_tool("intercom_wait", {"timeout_s": 10, "max_chars": 10}))
+    assert r["m"][0]["body"].startswith("xxxxxxxxxx…[+40 chars")
