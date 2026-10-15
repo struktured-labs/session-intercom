@@ -40,6 +40,9 @@ logger = logging.getLogger("session-intercom")
 _current_session: str | None = None
 # Set once on register; the tailer waits on this before polling.
 _tailer_ready = anyio.Event()
+# Set by the HTTP front end: identity is fixed; register/from_name/name may not
+# impersonate another session.
+_locked_identity: str | None = None
 
 
 def _resolve_name(provided: str | None) -> str:
@@ -232,6 +235,12 @@ async def list_tools() -> list[types.Tool]:
 
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextContent]:
     global _current_session
+    if _locked_identity is not None:
+        for key in ("name", "from_name"):
+            if key in arguments and arguments[key] not in (None, "", _locked_identity) and not (
+                name in ("intercom_history", "intercom_create_channel")
+            ):
+                return _err(f"this endpoint is locked to identity '{_locked_identity}'")
     try:
         if name == "intercom_register":
             session = await db.register_session(arguments["name"], arguments.get("metadata"), None)

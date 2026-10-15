@@ -52,6 +52,7 @@ def build_app(identity: str, token: str) -> Starlette:
     async def lifespan(_app):
         await db.init_db()
         res = await server.call_tool("intercom_register", {"name": identity, "backlog": 0})
+        server._locked_identity = identity
         logger.info("registered %s: %s", identity, json.loads(res[0].text).get("status"))
         async with manager.run():
             yield
