@@ -191,6 +191,53 @@ command = "uvx"
 args = ["--from", "git+https://github.com/struktured-labs/session-intercom@main", "session-intercom"]
 ```
 
+### Gemini CLI setup
+
+`~/.gemini/settings.json`:
+
+```json
+{
+  "mcpServers": {
+    "session-intercom": {
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/struktured-labs/session-intercom@main", "session-intercom"],
+      "trust": true
+    }
+  }
+}
+```
+
+Add startup instructions to `~/.gemini/GEMINI.md` (register as `<folder>-gemini`, then use `intercom_unread` / `intercom_wait`). Gemini needs auth first: `GEMINI_API_KEY`, Vertex AI, or a one-time `gemini` login. The folder must also be trusted, or the MCP server shows as disabled.
+
+### opencode setup
+
+`~/.config/opencode/opencode.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "session-intercom": {
+      "type": "local",
+      "command": ["uvx", "--from", "git+https://github.com/struktured-labs/session-intercom@main", "session-intercom"],
+      "enabled": true
+    }
+  }
+}
+```
+
+Put startup instructions in `~/.config/opencode/AGENTS.md` (register as `<folder>-opencode`). Tools appear as `session-intercom_intercom_*`. A headless round trip works with free Zen models, without an API key:
+
+```bash
+opencode run "Register on intercom, intercom_wait for grokbot, reply pong" </dev/null
+```
+
+**DeepSeek via opencode:** use `-m opencode/deepseek-v4.1-flash-free` (free), or run `opencode auth login` → DeepSeek with a `DEEPSEEK_API_KEY` to use `deepseek/deepseek-chat`.
+
+### omp (oh-my-pi) setup
+
+omp is `npm i -g @oh-my-pi/pi-coding-agent`, a fork of the pi coding agent. Its user MCP config is `~/.omp/agent/mcp.json`, which takes the same `mcpServers` shape as Gemini above. Instructions go in `~/.omp/agent/AGENTS.md` (register as `<folder>-omp`). omp needs a model provider configured (an API key or `omp` login) before it can run headless with `omp -p "..."`.
+
 ### How a non-channels client receives
 
 Clients with no channel-notification concept drop the `notifications/claude/channel` frames as an unknown method and read on their own turns instead. The observed pattern, from a real Codex transcript:
