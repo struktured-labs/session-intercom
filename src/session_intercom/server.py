@@ -17,6 +17,7 @@ Architecture:
 
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 from dataclasses import asdict
@@ -43,11 +44,23 @@ _tailer_ready = anyio.Event()
 # Set by the HTTP front end: identity is fixed; register/from_name/name may not
 # impersonate another session.
 _locked_identity: str | None = None
+# Per-request identity lock (multi-token HTTP front end). Takes precedence
+# over the process-wide _locked_identity.
+_request_identity: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "intercom_request_identity", default=None
+)
+
+
+def _locked() -> str | None:
+    return _request_identity.get() or _locked_identity
 
 
 def _resolve_name(provided: str | None) -> str:
     if provided:
         return provided
+    locked = _locked()
+    if locked:
+        return locked
     if _current_session:
         return _current_session
     raise ValueError(
@@ -318,18 +331,22 @@ async def list_tools() -> list[types.Tool]:
 
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextContent]:
     global _current_session
-    if _locked_identity is not None:
+    locked = _locked()
+    if locked is not None:
         for key in ("name", "from_name"):
             if (
                 key in arguments
-                and arguments[key] not in (None, "", _locked_identity)
+                and arguments[key] not in (None, "", locked)
                 and name not in ("intercom_history", "intercom_create_channel")
             ):
-                return _err(f"this endpoint is locked to identity '{_locked_identity}'")
+                return _err(f"this endpoint is locked to identity '{locked}'")
+        if name == "intercom_register":
+            arguments = {**arguments, "name": locked}
     try:
         if name == "intercom_register":
             session = await db.register_session(arguments["name"], arguments.get("metadata"), None)
-            _current_session = arguments["name"]
+            if _request_identity.get() is None:
+                _current_session = arguments["name"]
             backlog = arguments.get("backlog", db.DEFAULT_BACKLOG)
             replay = await db.init_tailer_cursor(arguments["name"], backlog)
             subs = await db.list_subscriptions(arguments["name"])
@@ -439,7 +456,9 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
         if name == "intercom_list_channels":
             channels = await db.list_channels()
             subs = (
-                set(await db.list_subscriptions(_resolve_name(None))) if _current_session else set()
+                set(await db.list_subscriptions(_resolve_name(None)))
+                if (_current_session or _locked())
+                else set()
             )
             return _ok(
                 {
